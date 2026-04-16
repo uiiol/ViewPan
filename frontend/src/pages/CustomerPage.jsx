@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useRef } from "react";
-import { Row, Col, Card, Table, Segmented, Badge, Select, Button, Input } from "antd";
+import { Row, Col, Card, Table, Segmented, Badge, Select, Button, Input, Collapse } from "antd";
 import { PhoneOutlined, CheckCircleOutlined, ClockCircleOutlined, RiseOutlined } from "@ant-design/icons";
 import { Statistic } from "antd";
 import FilterBar from "../components/FilterBar";
@@ -58,6 +58,7 @@ export default function CustomerPage() {
   const [ranking, setRanking] = useState([]);
   const [rankingMetric, setRankingMetric] = useState("call_minutes");
   const [rankingLimit, setRankingLimit] = useState(20);
+  const [rankingGrowthSort, setRankingGrowthSort] = useState(null); // null | "growth_desc" | "shrink_desc"
   const [selectedCustomerInTable, setSelectedCustomerInTable] = useState(null);
   const [customerTrend, setCustomerTrend] = useState([]);
   const [customerAnalysis, setCustomerAnalysis] = useState("");
@@ -65,8 +66,24 @@ export default function CustomerPage() {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState(null);
   const [aiRetryCount, setAiRetryCount] = useState(0);
+  const [aiResultCollapsed, setAiResultCollapsed] = useState(true);
+  const [visibleColumns, setVisibleColumns] = useState(null); // null = all visible
 
   const [loading, setLoading] = useState(true);
+
+  // AI 分析缓存（localStorage）
+  const getAiCacheKey = (companyId, year) => `ai_analysis_${companyId}_${year}`;
+  const loadAiCache = (companyId, year) => {
+    try {
+      const raw = localStorage.getItem(getAiCacheKey(companyId, year));
+      return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+  };
+  const saveAiCache = (companyId, year, result) => {
+    try {
+      localStorage.setItem(getAiCacheKey(companyId, year), JSON.stringify(result));
+    } catch {}
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -87,9 +104,10 @@ export default function CustomerPage() {
     api.getMonths(selectedYear).then(setAvailableMonths);
   }, [selectedYear]);
 
-  // 选中客户时，获取其12个月趋势
+  // 选中客户时，获取其12个月趋势 + 加载缓存的AI结果
   useEffect(() => {
-    if (!selectedCustomerInTable || !selectedYear) {
+    const custId = selectedCompany || selectedCustomerInTable;
+    if (!custId || !selectedYear) {
       setCustomerTrend([]);
       setCustomerAnalysis("");
       setAiResult("");
@@ -97,15 +115,24 @@ export default function CustomerPage() {
       setAiRetryCount(0);
       return;
     }
+    // 加载缓存的AI分析结果，有内容则展开
+    const cached = loadAiCache(custId, selectedYear);
+    if (cached) {
+      setAiResult(cached.analysis || "");
+      setCustomerAnalysis(cached.user_analysis || "");
+      if (cached.analysis) setAiResultCollapsed(false);
+    } else {
+      setAiResult("");
+      setCustomerAnalysis("");
+    }
     api.getMonthlyTrend({
       year: selectedYear,
-      company_id: selectedCustomerInTable,
+      company_id: custId,
     }).then(data => {
-      // 取所有月份（全年），并取最近的12个月
       const sorted = Array.isArray(data) ? [...data].sort((a, b) => a.month - b.month) : [];
       setCustomerTrend(sorted.slice(-12));
     });
-  }, [selectedCustomerInTable, selectedYear]);
+  }, [selectedCustomerInTable, selectedYear, selectedCompany]);
 
   // 渠道变化时联动客户列表
   useEffect(() => {
@@ -123,7 +150,10 @@ export default function CustomerPage() {
     const abortCtrl = new AbortController();
 
     setLoading(true);
+    // 筛客户优先，其次点击客户
+    const activeCustomerId = selectedCompany || selectedCustomerInTable;
     let quarter = null, month = null, monthStart = null, monthEnd = null;
+
     if (selectedPeriod === "full-year") {}
     else if (["Q1", "Q2", "Q3", "Q4"].includes(selectedPeriod)) quarter = selectedPeriod;
     else if (selectedPeriod === "first-half") { quarter = "H1"; }
@@ -142,12 +172,12 @@ export default function CustomerPage() {
       params.end_date = `${selectedYear}-${String(customEnd).padStart(2, "0")}-01`;
     }
     if (selectedChannel) params.channel_name = selectedChannel;
-    if (selectedCompany) params.company_id = selectedCompany;
+    if (activeCustomerId) params.company_id = activeCustomerId;
 
     const isDailyMode = month !== null;
     const trendParams = { year: selectedYear };
     if (selectedChannel) trendParams.channel_name = selectedChannel;
-    if (selectedCompany) trendParams.company_id = selectedCompany;
+    if (activeCustomerId) trendParams.company_id = activeCustomerId;
     if (isDailyMode) {
       trendParams.start_date = monthStart.format("YYYY-MM-DD");
       trendParams.end_date = monthEnd.format("YYYY-MM-DD");
@@ -162,7 +192,15 @@ export default function CustomerPage() {
       trendParams.compare_year = selectedYear - 1;
     }
 
-    const rankingParams = { year: selectedYear, channel_name: selectedChannel, quarter, month, metric: rankingMetric, limit: rankingLimit, start_date: params.start_date, end_date: params.end_date };
+    const rankingParams = {
+      year: selectedYear, channel_name: selectedChannel, company_id: activeCustomerId, quarter, month,
+      metric: rankingMetric, limit: rankingLimit,
+      start_date: params.start_date, end_date: params.end_date,
+    };
+    if (rankingGrowthSort) {
+      rankingParams.sort_by_growth = rankingGrowthSort;
+      rankingParams.compare_year = selectedYear - 1;
+    }
 
     Promise.all([
       api.getOverview(params),
@@ -181,7 +219,7 @@ export default function CustomerPage() {
     });
 
     return () => abortCtrl.abort();
-  }, [selectedYear, selectedPeriod, selectedChannel, selectedCompany, rankingMetric, rankingLimit, customStart, customEnd]);
+  }, [selectedYear, selectedPeriod, selectedChannel, selectedCompany, selectedCustomerInTable, rankingMetric, rankingLimit, rankingGrowthSort, customStart, customEnd]);
 
   const avgConnectRate = overview?.avg_connect_rate ? pctFmt(overview.avg_connect_rate) : "-";
   const intentRate = overview?.ab_intent && overview?.connected_calls
@@ -252,6 +290,10 @@ export default function CustomerPage() {
     return statsFromArr(ranking, rankingMetric);
   }, [ranking, rankingMetric]);
   const getCustRankColor = (val) => {
+    if (showGrowthCol) {
+      if (val == null) return "#5470c6";
+      return val >= 0 ? "#52c41a" : "#ff4d4f";
+    }
     if (val == null || !custRankingStats.q3) return "#5470c6";
     if (val >= custRankingStats.q3) return "#52c41a";
     if (val <= custRankingStats.q1) return "#ff4d4f";
@@ -262,18 +304,39 @@ export default function CustomerPage() {
   const totalCallMinutes = useMemo(() => ranking.reduce((s, r) => s + (r.call_minutes || 0), 0), [ranking]);
 
   const metricLabel = { call_minutes: "通话分钟数", total_calls: "外呼量", connected_calls: "接通量" };
+  const showGrowthCol = rankingGrowthSort != null;
+  const growthFmt = (v) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`;
   const rankingOption = {
+    animation: true,
+    animationDuration: 600,
+    animationEasing: "cubicOut",
     tooltip: {
       trigger: "axis", axisPointer: { type: "shadow" },
       formatter: params => {
         const d = params[0];
         const item = ranking.find(r => r.company_name === d.name);
         const channel = item?.channel_name || "-";
+        if (showGrowthCol && item) {
+          const curr = item[rankingMetric] || 0;
+          const prev = item[`prev_${rankingMetric}`] || 0;
+          const absDelta = curr - prev;
+          const absSign = absDelta >= 0 ? "+" : "";
+          return `${d.name}<br/>渠道商: ${channel}<br/>` +
+            `同比增长率: ${growthFmt(d.value)}<br/>` +
+            `同比绝对值: ${absSign}${numFmt(absDelta)}<br/>` +
+            `当期: ${numFmt(curr)} / 同期: ${numFmt(prev)}`;
+        }
         return `${d.name}<br/>渠道商: ${channel}<br/>${metricLabel[rankingMetric]}: ${numFmt(d.value)}`;
       },
     },
     grid: { left: 150, right: 80, bottom: 20, top: 20 },
-    xAxis: { type: "value", axisLabel: { formatter: v => numFmt(v) }, show: true },
+    xAxis: {
+      type: "value",
+      axisLabel: {
+        formatter: showGrowthCol ? v => growthFmt(v) : v => numFmt(v),
+      },
+      show: true,
+    },
     yAxis: {
       type: "category",
       data: [...ranking].reverse().map(d => d.company_name),
@@ -282,14 +345,22 @@ export default function CustomerPage() {
     series: [{
       type: "bar",
       data: [...ranking].reverse().map(d => ({
-        value: d[rankingMetric],
-        itemStyle: { color: getCustRankColor(d[rankingMetric]) },
+        value: showGrowthCol ? d.growth_rate : d[rankingMetric],
+        itemStyle: { color: getCustRankColor(showGrowthCol ? d.growth_rate : d[rankingMetric]) },
       })),
       label: {
         show: true, position: "right",
-        formatter: p => numFmt(p.value),
+        formatter: p => showGrowthCol ? growthFmt(p.value) : numFmt(p.value),
       },
     }],
+  };
+
+  const handleChartClick = (params) => {
+    const clickedName = params.name;
+    const clickedRow = ranking.find(r => r.company_name === clickedName);
+    if (clickedRow) {
+      setSelectedCustomerInTable(selectedCustomerInTable === clickedRow.company_id ? null : clickedRow.company_id);
+    }
   };
 
   const customerTrendOption = {
@@ -362,10 +433,55 @@ export default function CustomerPage() {
       align: "right",
       sorter: { compare: (a, b) => (a.call_minutes || 0) - (b.call_minutes || 0) },
     },
+    ...(showGrowthCol ? [{
+      title: "同比增长率",
+      key: "growth_rate",
+      render: (_, row) => {
+        if (row.growth_rate == null) return <span style={{ color: "#aaa" }}>无同期</span>;
+        const sign = row.growth_rate >= 0 ? "+" : "";
+        const color = row.growth_rate >= 0 ? "#52c41a" : "#ff4d4f";
+        return <span style={{ color, fontWeight: 600 }}>{sign}{(row.growth_rate * 100).toFixed(1)}%</span>;
+      },
+      align: "right",
+      sorter: { compare: (a, b) => (a.growth_rate ?? -Infinity) - (b.growth_rate ?? -Infinity) },
+    }] : []),
   ];
+
+  // 可选列定义（key → label）
+  const ALL_COLUMNS = [
+    { key: "channel_name", label: "渠道商" },
+    { key: "call_minutes", label: "通话分钟数" },
+    { key: "total_calls", label: "外呼量" },
+    { key: "connected_calls", label: "接通量" },
+    { key: "avg_connect_rate", label: "平均接通率" },
+    { key: "intent_rate", label: "AB意向率" },
+    { key: "minutes_share", label: "分钟数占比" },
+    ...(showGrowthCol ? [{ key: "growth_rate", label: "同比增长率" }] : []),
+  ];
+  // 默认全部选中
+  const defaultVisible = ALL_COLUMNS.map(c => c.key);
+  const currentVisible = visibleColumns || defaultVisible;
+  const filteredColumns = rankingColumns.filter(col => {
+    // 排名和客户名称始终显示
+    if (col.key === "rank" || col.key === "company_name") return true;
+    return currentVisible.includes(col.key);
+  });
+
+  // 筛选项选客户时，同步更新排行榜选中态
+  useEffect(() => {
+    if (selectedCompany !== null) {
+      setSelectedCustomerInTable(selectedCompany);
+    }
+  }, [selectedCompany]);
+
+  // 选中的客户对象（筛客户优先，其次点击客户）
+  const selectedCustomer = selectedCompany
+    ? ranking.find(r => r.company_id === selectedCompany)
+    : (selectedCustomerInTable ? ranking.find(r => r.company_id === selectedCustomerInTable) : null);
 
   return (
     <div style={{ padding: "20px 24px" }}>
+      {/* ① 筛选栏（始终固定顶部） */}
       <Card bordered={false} style={{ marginBottom: 16, position: "sticky", top: 64, zIndex: 100 }}>
         <FilterBar
           years={years} selectedYear={selectedYear} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); }}
@@ -379,40 +495,11 @@ export default function CustomerPage() {
         />
       </Card>
 
-      <Row gutter={[16, 16]}>
-        {[
-          { title: "总外呼量", value: numFmt(overview?.total_calls), icon: <PhoneOutlined />, color: "#5470c6" },
-          { title: "总通话分钟数", value: numFmt(overview?.call_minutes), icon: <ClockCircleOutlined />, color: "#fac858" },
-          { title: "平均接通率", value: avgConnectRate, icon: <CheckCircleOutlined />, color: "#91cc75" },
-          { title: "AB意向率", value: intentRate, icon: <RiseOutlined />, color: "#ee6666" },
-        ].map(item => (
-          <Col xs={12} sm={8} xl={6} key={item.title}>
-            <Card bordered={false} style={{ borderTop: `3px solid ${item.color}` }}>
-              <Statistic title={<span style={{ fontSize: 13 }}>{item.title}</span>} value={item.value}
-                prefix={<span style={{ color: item.color }}>{item.icon}</span>} />
-            </Card>
-          </Col>
-        ))}
-      </Row>
-
-      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-        <Col span={24}>
-          <TrendChart title={chartTitle} data={trendData} isDaily={isDaily} />
-        </Col>
-      </Row>
-
-      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-        <Col span={24}>
-          <Card title={isDaily ? "日环比" : "月度环比（环比：与上月比；同比：与去年同月比）"} bordered={false}>
-            <Table columns={deltaColumns} dataSource={trendWithDelta} rowKey={isDaily ? "date" : "month"}
-              pagination={false} size="small" scroll={{ x: isDaily ? 800 : 1100 }} />
-          </Card>
-        </Col>
-      </Row>
-
-      {/* 客户排行榜图表（始终全宽） */}
-      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-        <Col span={24}>
+      {/* ② 客户排行榜 + 客户详情（左右布局） */}
+      <Row gutter={[16, 16]} align="stretch">
+        {/* 左侧：排行榜（图表 + 表格） */}
+        <Col span={selectedCustomer ? 10 : 24} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {/* 排行榜图表 */}
           <Card
             title={
               <span>
@@ -421,78 +508,86 @@ export default function CustomerPage() {
                   size="small"
                   value={rankingLimit}
                   onChange={v => { setRankingLimit(v); setSelectedCustomerInTable(null); }}
-                  style={{ width: 70, marginLeft: 6, marginRight: 12 }}
+                  style={{ width: 80, marginLeft: 6, marginRight: 12 }}
                   options={[
-                    { label: "20", value: 20 },
-                    { label: "50", value: 50 },
-                    { label: "100", value: 100 },
+                    { label: "TOP20", value: 20 },
+                    { label: "TOP50", value: 50 },
+                    { label: "TOP100", value: 100 },
+                    { label: "全部", value: 0 },
                   ]}
                 />
                 <span style={{ fontSize: 12, color: "#888" }}>
                   <Segmented
                     size="small"
                     value={rankingMetric}
-                    onChange={v => { setRankingMetric(v); setSelectedCustomerInTable(null); }}
+                    onChange={v => { setRankingMetric(v); setSelectedCustomerInTable(null); setRankingGrowthSort(null); }}
                     options={[
                       { label: "通话分钟数", value: "call_minutes" },
                       { label: "外呼量", value: "total_calls" },
                       { label: "接通量", value: "connected_calls" },
                     ]}
                   />
+                  <span style={{ marginLeft: 8 }}>|</span>
+                  <Segmented
+                    size="small"
+                    value={rankingGrowthSort}
+                    onChange={v => { setRankingGrowthSort(v); setSelectedCustomerInTable(null); }}
+                    options={[
+                      { label: "按数值", value: null },
+                      { label: "📈 增长最快", value: "growth_desc" },
+                      { label: "📉 萎缩最大", value: "shrink_desc" },
+                    ]}
+                    style={{ marginLeft: 8 }}
+                  />
                   <span style={{ marginLeft: 8 }}>
-                    <span style={{ color: "#52c41a" }}>●</span> 优秀&nbsp;
-                    <span style={{ color: "#5470c6" }}>●</span> 正常&nbsp;
-                    <span style={{ color: "#ff4d4f" }}>●</span> 需关注&nbsp;
-                    [中位数 {numFmt(custRankingStats.median)} / 平均 {numFmt(custRankingStats.avg)}]
+                    {rankingGrowthSort ? null : (
+                      <>
+                        <span style={{ color: "#52c41a" }}>●</span> 优秀&nbsp;
+                        <span style={{ color: "#5470c6" }}>●</span> 正常&nbsp;
+                        <span style={{ color: "#ff4d4f" }}>●</span> 需关注&nbsp;
+                        [中位数 {numFmt(custRankingStats.median)} / 平均 {numFmt(custRankingStats.avg)}]
+                      </>
+                    )}
                   </span>
                 </span>
               </span>
             }
             bordered={false}
           >
-            <EChart option={rankingOption} style={{ height: Math.max(300, ranking.length * 28) }} />
+            <EChart option={rankingOption} style={{ height: Math.max(300, ranking.length * 28) }} onChartClick={handleChartClick} />
           </Card>
-        </Col>
-      </Row>
 
-      {/* 客户明细（左右联动） */}
-      <Row gutter={[16, 16]} style={{ marginTop: 16 }} align="stretch">
-        {/* 左侧：客户明细表格 */}
-        <Col span={selectedCustomerInTable ? 10 : 24} style={{ display: "flex", flexDirection: "column" }}>
+          {/* 客户明细表格 */}
           <Card
-            title={
-              <span>
-                客户明细
-                {selectedCustomerInTable && (
-                  <span style={{ fontSize: 12, color: "#888", marginLeft: 12 }}>
-                    <Segmented
-                      size="small"
-                      value={rankingMetric}
-                      onChange={v => setRankingMetric(v)}
-                      options={[
-                        { label: "通话分钟数", value: "call_minutes" },
-                        { label: "外呼量", value: "total_calls" },
-                        { label: "接通量", value: "connected_calls" },
-                      ]}
-                    />
+            title="客户明细"
+            bordered={false}
+            extra={
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 12, color: "#888" }}>显示列：</span>
+                <Select
+                  mode="multiple"
+                  size="small"
+                  value={currentVisible}
+                  onChange={v => setVisibleColumns(v)}
+                  style={{ minWidth: 160 }}
+                  options={ALL_COLUMNS.map(c => ({ label: c.label, value: c.key }))}
+                  maxTagCount={2}
+                  placeholder="选择列"
+                />
+                {selectedCustomer && (
+                  <span style={{ fontSize: 12, color: "#1677ff", cursor: "pointer" }} onClick={() => setSelectedCustomerInTable(null)}>
+                    清除选择
                   </span>
                 )}
               </span>
             }
-            bordered={false}
-            extra={selectedCustomerInTable && (
-              <span style={{ fontSize: 12, color: "#1677ff", cursor: "pointer" }} onClick={() => setSelectedCustomerInTable(null)}>
-                清除选择
-              </span>
-            )}
-            style={{ flex: 1, display: "flex", flexDirection: "column" }}
-            bodyStyle={{ flex: 1, overflow: "auto" }}
+            bodyStyle={{ padding: selectedCustomer ? undefined : 0 }}
           >
             <Table
-              columns={rankingColumns}
+              columns={filteredColumns}
               dataSource={ranking}
               rowKey="company_id"
-              pagination={{ pageSize: rankingLimit }}
+              pagination={selectedCompany ? false : { pageSize: rankingLimit }}
               size="small"
               rowClassName={row => selectedCustomerInTable === row.company_id ? "ant-table-row-selected" : ""}
               onRow={row => ({
@@ -503,85 +598,98 @@ export default function CustomerPage() {
           </Card>
         </Col>
 
-        {/* 右侧：客户月度趋势（选中后出现） */}
-        {selectedCustomerInTable && (() => {
-          const customer = ranking.find(r => r.company_id === selectedCustomerInTable);
-          if (!customer) return null;
-          return (
-            <Col span={14} style={{ position: "relative" }}>
-              <div style={{ position: "sticky", top: 80, zIndex: 200 }}>
-                <Card
-                  title={
-                    <span>
-                      {customer.company_name}
-                      <span style={{ fontSize: 12, color: "#888", marginLeft: 8 }}>
-                        [{customer.channel_name}]
-                      </span>
-                      <span style={{ fontSize: 12, color: "#aaa", marginLeft: 8 }}>
-                        — 过去12个月趋势（{metricLabel[rankingMetric]}）
-                      </span>
+        {/* 右侧：客户详情（选中后出现，始终固定在画面中） */}
+        {selectedCustomer && (
+          <Col span={14}>
+            {/* 随页面自然滚动，移除了 sticky */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {/* AI分析（置顶） */}
+              <Card
+                title={
+                  <span>
+                    {selectedCustomer.company_name}
+                    <span style={{ fontSize: 12, color: "#888", marginLeft: 8 }}>[{selectedCustomer.channel_name}]</span>
+                    <span style={{ fontSize: 12, color: "#aaa", marginLeft: 8 }}>
+                      AI 分析
                     </span>
-                  }
-                  bordered={false}
-                >
-                  <EChart option={customerTrendOption} style={{ height: Math.max(320, customerTrend.length * 30) }} />
-                  <div style={{ marginTop: 16, borderTop: "1px solid #f0f0f0", paddingTop: 12 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                      <span style={{ fontSize: 13, fontWeight: 500, color: "#333" }}>AI 分析</span>
+                    <span style={{ marginLeft: 8 }}>
                       <Button
-                        type="primary"
+                        type="text"
                         size="small"
-                        disabled={aiLoading}
-                        onClick={() => {
-                          const overviewData = {
-                            total_calls: customer.total_calls,
-                            connected_calls: customer.connected_calls,
-                            call_minutes: customer.call_minutes,
-                            avg_connect_rate: customer.avg_connect_rate,
-                            intent_rate: customer.intent_rate,
-                            year: selectedYear,
-                          };
-                          setAiLoading(true);
-                          setAiError(null);
-                          setAiRetryCount(0);
-
-                          const doRequest = (retryCount) => {
-                            api.postAiAnalysis({
-                              company_name: customer.company_name,
-                              channel_name: customer.channel_name,
-                              overview: overviewData,
-                              monthly_data: customerTrend,
-                              user_analysis: customerAnalysis,
-                              ranking_metric: rankingMetric,
-                            }).then(res => {
-                              setAiResult(res.analysis || "AI 暂未返回分析内容");
-                              setAiLoading(false);
-                              setAiRetryCount(0);
-                            }).catch(err => {
-                              const detail = err?.response?.data?.detail || "";
-                              // 负载过高：等待后自动重试，最多3次
-                              if (detail.includes("负载较高") && retryCount < 3) {
-                                setAiRetryCount(retryCount + 1);
-                                setAiError(`服务繁忙，${(retryCount + 1) * 5}秒后自动重试... (${retryCount + 1}/3)`);
-                                setTimeout(() => doRequest(retryCount + 1), (retryCount + 1) * 5000);
-                              } else if (detail.includes("负载较高") && retryCount >= 3) {
-                                setAiError("服务负载过高，请稍后再试");
-                                setAiLoading(false);
-                                setAiRetryCount(0);
-                              } else {
-                                setAiError(detail || "AI 分析请求失败");
-                                setAiLoading(false);
-                                setAiRetryCount(0);
-                              }
-                            });
-                          };
-
-                          doRequest(0);
-                        }}
+                        onClick={() => setAiResultCollapsed(c => !c)}
+                        style={{ fontSize: 12, color: aiResultCollapsed ? "#1677ff" : "#888" }}
                       >
-                        {aiLoading ? (aiRetryCount > 0 ? `重试中 (${aiRetryCount}/3)` : "分析中...") : "AI 分析"}
+                        {aiResultCollapsed ? "▶ 展开" : "▼ 折叠"}
                       </Button>
-                    </div>
+                    </span>
+                  </span>
+                }
+                bordered={false}
+                size="small"
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ fontSize: 12, color: "#888" }}>基于该客户的历史数据生成分析报告</span>
+                  <Button
+                    type="primary"
+                    size="small"
+                    disabled={aiLoading}
+                    onClick={() => {
+                      const overviewData = {
+                        total_calls: selectedCustomer.total_calls,
+                        connected_calls: selectedCustomer.connected_calls,
+                        call_minutes: selectedCustomer.call_minutes,
+                        avg_connect_rate: selectedCustomer.avg_connect_rate,
+                        intent_rate: selectedCustomer.intent_rate,
+                        year: selectedYear,
+                      };
+                      setAiLoading(true);
+                      setAiError(null);
+                      setAiRetryCount(0);
+
+                      const doRequest = (retryCount) => {
+                        api.postAiAnalysis({
+                          company_name: selectedCustomer.company_name,
+                          channel_name: selectedCustomer.channel_name,
+                          overview: overviewData,
+                          monthly_data: customerTrend,
+                          user_analysis: customerAnalysis,
+                          ranking_metric: rankingMetric,
+                        }).then(res => {
+                          const analysisResult = res.analysis || "AI 暂未返回分析内容";
+                          setAiResult(analysisResult);
+                          setAiLoading(false);
+                          setAiRetryCount(0);
+                          // 覆盖式缓存
+                          saveAiCache(selectedCustomer.company_id, selectedYear, {
+                            analysis: analysisResult,
+                            user_analysis: customerAnalysis,
+                          });
+                        }).catch(err => {
+                          const detail = err?.response?.data?.detail || "";
+                          if (detail.includes("负载较高") && retryCount < 3) {
+                            setAiRetryCount(retryCount + 1);
+                            setAiError(`服务繁忙，${(retryCount + 1) * 5}秒后自动重试... (${retryCount + 1}/3)`);
+                            setTimeout(() => doRequest(retryCount + 1), (retryCount + 1) * 5000);
+                          } else if (detail.includes("负载较高") && retryCount >= 3) {
+                            setAiError("服务负载过高，请稍后再试");
+                            setAiLoading(false);
+                            setAiRetryCount(0);
+                          } else {
+                            setAiError(detail || "AI 分析请求失败");
+                            setAiLoading(false);
+                            setAiRetryCount(0);
+                          }
+                        });
+                      };
+
+                      doRequest(0);
+                    }}
+                  >
+                    {aiLoading ? (aiRetryCount > 0 ? `重试中 (${aiRetryCount}/3)` : "分析中...") : "AI 分析"}
+                  </Button>
+                </div>
+                {!aiResultCollapsed ? (
+                  <>
                     <Input.TextArea
                       rows={3}
                       placeholder="记录您对该客户的分析判断，分析结果将显示在下方..."
@@ -607,12 +715,57 @@ export default function CustomerPage() {
                         {aiResult}
                       </div>
                     )}
+                  </>
+                ) : (
+                  <div style={{ color: "#aaa", fontSize: 12, textAlign: "center", padding: "8px 0" }}>
+                    分析内容已折叠，点击上方"展开"查看
                   </div>
-                </Card>
-              </div>
-            </Col>
-          );
-        })()}
+                )}
+              </Card>
+
+              {/* 统计卡片 */}
+              <Row gutter={[12, 12]}>
+                {[
+                  { title: "总外呼量", value: numFmt(selectedCustomer.total_calls), icon: <PhoneOutlined />, color: "#5470c6" },
+                  { title: "总通话分钟数", value: numFmt(selectedCustomer.call_minutes), icon: <ClockCircleOutlined />, color: "#fac858" },
+                  { title: "平均接通率", value: pctFmt(selectedCustomer.avg_connect_rate), icon: <CheckCircleOutlined />, color: "#91cc75" },
+                  { title: "AB意向率", value: pctFmt(selectedCustomer.intent_rate), icon: <RiseOutlined />, color: "#ee6666" },
+                ].map(item => (
+                  <Col xs={12} sm={6} key={item.title}>
+                    <Card bordered={false} size="small" style={{ borderTop: `3px solid ${item.color}` }}>
+                      <Statistic
+                        title={<span style={{ fontSize: 12 }}>{item.title}</span>}
+                        value={item.value}
+                        prefix={<span style={{ color: item.color }}>{item.icon}</span>}
+                      />
+                    </Card>
+                  </Col>
+                ))}
+              </Row>
+
+              {/* 趋势图 */}
+              <Card title={chartTitle} bordered={false} size="small">
+                <TrendChart title={chartTitle} data={trendData} isDaily={isDaily} />
+              </Card>
+
+              {/* 环比表 */}
+              <Card
+                title={isDaily ? "日环比" : "月度环比（环比：与上月比；同比：与去年同月比）"}
+                bordered={false}
+                size="small"
+              >
+                <Table
+                  columns={deltaColumns}
+                  dataSource={trendWithDelta}
+                  rowKey={isDaily ? "date" : "month"}
+                  pagination={false}
+                  size="small"
+                  scroll={{ x: isDaily ? 800 : 1100 }}
+                />
+              </Card>
+            </div>
+          </Col>
+        )}
       </Row>
     </div>
   );
