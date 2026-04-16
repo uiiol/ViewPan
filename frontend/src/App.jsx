@@ -51,7 +51,7 @@ export default function App() {
           }}
           items={[
             { key: "dashboard", label: "数据大盘" },
-            { key: "channel", label: "供应商分析" },
+            { key: "channel", label: "渠道商分析" },
             { key: "customer", label: "单一客户分析" },
           ]}
           style={{ flex: 1 }}
