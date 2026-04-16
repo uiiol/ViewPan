@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  backend-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8001:8000"
+    environment:
+      - IS_DOCKER=1
+    env_file:
+      - backend/.env.test
+    volumes:
+      - ./原数据:/app/原数据:ro
+      - ./backend/app:/app/app
+
+  frontend-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend-test
+    volumes:
+      - ./frontend/src:/app/src:ro
+      - ./frontend/nginx.test.conf:/etc/nginx/conf.d/default.conf:ro

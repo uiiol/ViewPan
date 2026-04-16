@@ -1,13 +1,14 @@
 node_modules/
 dist/
 .env
+.env.*
 *.log
 .DS_Store
 原数据/
 
-# Docker configs
-docker-compose.yml
-Dockerfile.*
+# Docker configs (keep in repo)
+# docker-compose.yml
+# Dockerfile.*
 
 # Import scripts
 backend/scripts/
