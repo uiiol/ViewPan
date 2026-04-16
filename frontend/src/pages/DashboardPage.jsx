@@ -196,9 +196,11 @@ export default function DashboardPage() {
         shrink.push({ value: [d.prev_ytd_minutes, d.curr_ytd_minutes], name: d.company_name });
       }
     });
-    const allVals = scatter.flatMap(d => [d.prev_ytd_minutes, d.curr_ytd_minutes]);
-    const maxVal = Math.max(...allVals.filter(v => v > 0), 1);
-    const maxAxis = maxVal * 1.1;
+    // 取85分位数作为轴上限，让大部分点集中在中心区域
+    const allVals = scatter.flatMap(d => [d.prev_ytd_minutes, d.curr_ytd_minutes]).filter(v => v > 0).sort((a, b) => a - b);
+    const p85Idx = Math.floor(allVals.length * 0.85);
+    const maxAxis = allVals[p85Idx] || 1;
+    const axisMax = maxAxis * 1.2;
     return {
       tooltip: {
         trigger: "item",
@@ -207,13 +209,13 @@ export default function DashboardPage() {
           : "",
       },
       grid: { left: 65, right: 20, bottom: 35, top: 15 },
-      xAxis: { type: "value", name: `${selectedYear - 1}年同期(分钟)`, axisLabel: { formatter: v => numFmt(v), fontSize: 10 }, max: maxAxis },
-      yAxis: { type: "value", name: `${selectedYear}年同期(分钟)`, axisLabel: { formatter: v => numFmt(v), fontSize: 10 }, max: maxAxis },
+      xAxis: { type: "value", name: `${selectedYear - 1}年同期(分钟)`, axisLabel: { formatter: v => numFmt(v), fontSize: 10 }, max: axisMax },
+      yAxis: { type: "value", name: `${selectedYear}年同期(分钟)`, axisLabel: { formatter: v => numFmt(v), fontSize: 10 }, max: axisMax },
       series: [
         { name: "增长", type: "scatter", data: growth, symbolSize: 9, itemStyle: { color: "#52c41a", opacity: 0.75 } },
         { name: "萎缩", type: "scatter", data: shrink, symbolSize: 9, itemStyle: { color: "#ff4d4f", opacity: 0.75 } },
         { name: "新客户", type: "scatter", data: newC, symbolSize: 11, itemStyle: { color: "#5470c6", opacity: 0.85 } },
-        { name: "参考线", type: "line", data: [[0, 0], [maxAxis, maxAxis]], lineStyle: { color: "#ccc", type: "dashed", width: 1 }, symbol: "none", tooltip: { show: false } },
+        { name: "参考线", type: "line", data: [[0, 0], [axisMax, axisMax]], lineStyle: { color: "#ccc", type: "dashed", width: 1 }, symbol: "none", tooltip: { show: false } },
       ],
     };
   })();
@@ -355,7 +357,7 @@ export default function DashboardPage() {
 
       {/* Row 3 */}
       <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-        <Col xs={24} md={8}>
+        <Col xs={24} md={10}>
           <Card title="客户结构（新老客户）" bordered={false} bodyStyle={{ paddingBottom: 8 }}>
             <EChart option={customerPieOption} style={{ height: ROW_H - 20 }} />
             <div style={{ textAlign: "center", fontSize: 11, color: "#888", marginTop: 2 }}>
@@ -365,12 +367,7 @@ export default function DashboardPage() {
             </div>
           </Card>
         </Col>
-        <Col xs={24} md={8}>
-          <Card title="渠道分布" bordered={false} bodyStyle={{ paddingBottom: 8 }}>
-            <EChart option={channelPieOption} style={{ height: ROW_H - 20 }} />
-          </Card>
-        </Col>
-        <Col xs={24} md={8}>
+        <Col xs={24} md={14}>
           <Card
             title="客户健康度（同期对比）"
             extra={<span style={{ fontSize: 10 }}><span style={{ color: "#52c41a" }}>●</span> 增长&nbsp;<span style={{ color: "#5470c6" }}>●</span> 新客户&nbsp;<span style={{ color: "#ff4d4f" }}>●</span> 萎缩</span>}

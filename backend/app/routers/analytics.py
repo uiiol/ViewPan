@@ -542,6 +542,25 @@ def get_channel_concentration(
     channel_totals = {row.channel_name: float(getattr(row, metric) or 0) for row in channel_total_q.all()}
     total_sum = sum(channel_totals.values())
     channels_count = len(channel_totals)
+    curr_channel_names = set(channel_totals.keys())
+
+    # 流失渠道：去年有外呼，今年同期无外呼
+    prev_year = year - 1
+    prev_cond = [extract("year", CallRecord.call_date) == prev_year]
+    if quarter and quarter in quarter_map:
+        ms, me = quarter_map[quarter]
+        prev_cond.append(extract("month", CallRecord.call_date) >= ms)
+        prev_cond.append(extract("month", CallRecord.call_date) <= me)
+    elif month:
+        prev_cond.append(extract("month", CallRecord.call_date) == month)
+    elif start_date:
+        prev_cond.append(CallRecord.call_date >= start_date)
+        if end_date:
+            prev_cond.append(CallRecord.call_date <= end_date)
+
+    prev_channel_q = db.query(CallRecord.channel_name).filter(and_(*prev_cond)).distinct()
+    prev_channel_names = set(row.channel_name for row in prev_channel_q.all())
+    churn_channel_count = len(prev_channel_names - curr_channel_names)
 
     # 二八法则：前20%渠道贡献
     sorted_channels = sorted(channel_totals.items(), key=lambda x: x[1], reverse=True)
@@ -611,6 +630,7 @@ def get_channel_concentration(
         "single_cust_channel_count": len(single_cust_channels),
         "single_cust_channels": single_cust_channels,
         "period_months": period_months,
+        "churn_channel_count": churn_channel_count,
     }
 
 
@@ -621,12 +641,24 @@ def get_dashboard_summary(
     db: Session = Depends(get_db),
 ):
     """数据大盘汇总：目标完成进度、新老客户、渠道分布"""
-    # 今年各月分钟数（先查出来决定哪些月份算YTD）
+    # 2026年：同期为 Jan 1 ~ 昨天；其他年份：全年
+    if year == 2026:
+        ytd_end_date = f"{year}-{yesterday.month:02d}-{yesterday.day:02d}"
+        curr_months = set(range(1, yesterday.month + 1))
+        prev_end_date = f"{year - 1}-{yesterday.month:02d}-{yesterday.day:02d}"
+    else:
+        ytd_end_date = f"{year}-12-31"
+        curr_months = set(range(1, 13))
+        prev_end_date = f"{year - 1}-12-31"
+
+    # 今年各月分钟数
     monthly_q = db.query(
         extract("month", CallRecord.call_date).label("month"),
         func.sum(CallRecord.call_minutes).label("call_minutes"),
-    ).filter(extract("year", CallRecord.call_date) == year) \
-     .group_by("month").order_by("month")
+    ).filter(
+        extract("year", CallRecord.call_date) == year,
+        CallRecord.call_date <= ytd_end_date,
+    ).group_by("month").order_by("month")
     monthly_data = [row._asdict() for row in monthly_q.all()]
 
     # 去年全年累计
@@ -637,16 +669,17 @@ def get_dashboard_summary(
 
     target = round(last_year_total * 1.2, 2)
 
-    # 去年各月分钟数
+    # 去年各月分钟数（同期）
     prev_monthly_q = db.query(
         extract("month", CallRecord.call_date).label("month"),
         func.sum(CallRecord.call_minutes).label("call_minutes"),
-    ).filter(extract("year", CallRecord.call_date) == year - 1) \
-     .group_by("month").order_by("month")
+    ).filter(
+        extract("year", CallRecord.call_date) == year - 1,
+        CallRecord.call_date <= prev_end_date,
+    ).group_by("month").order_by("month")
     prev_monthly_data = {int(row.month): float(row.call_minutes or 0) for row in prev_monthly_q.all()}
 
-    # 计算去年YTD节奏（去年到今年同月累计）
-    curr_months = set(int(m["month"]) for m in monthly_data)
+    # 计算去年YTD节奏（去年同期月份）
     last_ytd_pace = sum(prev_monthly_data.get(m, 0) for m in curr_months)
 
     # 今年累计分钟数
@@ -660,7 +693,7 @@ def get_dashboard_summary(
         func.sum(CallRecord.call_minutes).label("call_minutes"),
     ).filter(
         extract("year", CallRecord.call_date) == year - 1,
-        extract("month", CallRecord.call_date).in_(curr_months)
+        CallRecord.call_date <= prev_end_date,
     ).group_by(CallRecord.company_id, CallRecord.company_name, "month")
     prev_company_ytd = {}
     for row in prev_company_monthly_q.all():
@@ -685,7 +718,7 @@ def get_dashboard_summary(
         func.sum(CallRecord.call_minutes).label("call_minutes"),
     ).filter(
         extract("year", CallRecord.call_date) == year,
-        extract("month", CallRecord.call_date).in_(curr_months)
+        CallRecord.call_date <= ytd_end_date,
     ).group_by(CallRecord.company_id, CallRecord.company_name)
     curr_company_ytd_map = {
         row.company_id: { "company_name": row.company_name, "call_minutes": float(row.call_minutes or 0) }
@@ -736,7 +769,7 @@ def get_dashboard_summary(
         func.sum(CallRecord.call_minutes).label("call_minutes"),
     ).filter(
         extract("year", CallRecord.call_date) == year,
-        extract("month", CallRecord.call_date).in_(curr_months)
+        CallRecord.call_date <= ytd_end_date,
     ).group_by(CallRecord.channel_name).order_by(func.sum(CallRecord.call_minutes).desc())
     channel_breakdown = [
         { "channel_name": r.channel_name, "call_minutes": float(r.call_minutes or 0) }

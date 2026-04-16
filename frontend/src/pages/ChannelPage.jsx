@@ -361,9 +361,9 @@ export default function ChannelPage(props) {
       <Row gutter={[16, 16]} align="stretch">
         {/* 左侧：渠道商排行榜 */}
         <Col span={selectedChannelName ? 10 : 24} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          {/* 终端客户分布 — 始终显示在排行榜上方 */}
+          {/* 渠道商分布 — 始终显示在排行榜上方 */}
           {concentration && (
-            <Card title={`终端客户分布`} bordered={false} size="small">
+            <Card title={`渠道商分布`} bordered={false} size="small">
               <Row gutter={[12, 8]}>
                 <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>外呼渠道数</div>
@@ -372,33 +372,40 @@ export default function ChannelPage(props) {
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>渠道总数</div>
                 </Col>
-                <Col span={5}>
+                <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>二八法则</div>
                   <div style={{ fontSize: 22, fontWeight: 700, color: top20Contribution >= 0.8 ? "#ff4d4f" : top20Contribution >= 0.5 ? "#fa8c16" : "#52c41a" }}>
                     {(top20Contribution * 100).toFixed(1)}%
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>前20名渠道占分钟数</div>
                 </Col>
-                <Col span={5}>
+                <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>单客户撑起</div>
                   <div style={{ fontSize: 22, fontWeight: 700, color: concentration.single_cust_channel_count > 0 ? "#ff4d4f" : "#52c41a" }}>
                     {concentration.single_cust_channel_count}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>单客占比&gt;50%渠道数</div>
                 </Col>
-                <Col span={5}>
+                <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>头部渠道</div>
                   <div style={{ fontSize: 22, fontWeight: 700, color: concentration.head_channel_count > 0 ? "#ff4d4f" : "#52c41a" }}>
                     {concentration.head_channel_count}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>月均 &gt; 20万分钟</div>
                 </Col>
-                <Col span={5}>
+                <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>尾部渠道</div>
                   <div style={{ fontSize: 22, fontWeight: 700, color: concentration.tail_channel_count > 0 ? "#fa8c16" : "#52c41a" }}>
                     {concentration.tail_channel_count}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>月均 &lt; 1万分钟</div>
+                </Col>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>流失渠道</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: concentration.churn_channel_count > 0 ? "#ff4d4f" : "#52c41a" }}>
+                    {concentration.churn_channel_count}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>去年有今无</div>
                 </Col>
               </Row>
             </Card>
