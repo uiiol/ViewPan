@@ -9,8 +9,8 @@ dist/
 原数据/
 
 # Docker configs (keep in repo)
-# docker-compose.yml
-# docker-compose.test.yml
+# docker compose.yml
+# docker compose.test.yml
 # Dockerfile.*
 
 # Import scripts
