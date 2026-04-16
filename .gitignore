@@ -4,3 +4,10 @@ dist/
 *.log
 .DS_Store
 原数据/
+
+# Docker configs
+docker-compose.yml
+Dockerfile.*
+
+# Import scripts
+backend/scripts/
