@@ -67,7 +67,9 @@ export default function CustomerPage() {
   const [aiError, setAiError] = useState(null);
   const [aiRetryCount, setAiRetryCount] = useState(0);
   const [aiResultCollapsed, setAiResultCollapsed] = useState(true);
-  const [visibleColumns, setVisibleColumns] = useState(null); // null = all visible
+  const [visibleColumns, setVisibleColumns] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("custpage_visible_cols")); } catch { return null; }
+  });
 
   const [loading, setLoading] = useState(true);
 
@@ -87,14 +89,35 @@ export default function CustomerPage() {
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([api.getYears(), api.getChannels()]).then(([y, ch]) => {
-      if (cancelled) return;
-      const latest = y.length ? y[y.length - 1] : 2026;
-      setYears(y);
-      setChannels(ch);
-      setSelectedYear(latest);
-      api.getMonths(latest).then(m => { if (!cancelled) setAvailableMonths(m); });
-    });
+    const initChannel = sessionStorage.getItem("init_channel");
+    const initCompaniesRaw = sessionStorage.getItem("init_companies");
+    sessionStorage.removeItem("init_channel");
+    sessionStorage.removeItem("init_companies");
+
+    const initCompanies = initCompaniesRaw ? JSON.parse(initCompaniesRaw) : null;
+
+    if (initChannel && initCompanies) {
+      // 跳转来源：直接用传入的公司列表，不走API
+      Promise.all([api.getYears(), api.getChannels()]).then(([y, ch]) => {
+        if (cancelled) return;
+        const latest = y.length ? y[y.length - 1] : 2026;
+        setYears(y);
+        setChannels(ch);
+        setSelectedYear(latest);
+        setCompanies(initCompanies);
+        setSelectedChannel(initChannel);
+        api.getMonths(latest).then(m => { if (!cancelled) setAvailableMonths(m); });
+      });
+    } else {
+      Promise.all([api.getYears(), api.getChannels()]).then(([y, ch]) => {
+        if (cancelled) return;
+        const latest = y.length ? y[y.length - 1] : 2026;
+        setYears(y);
+        setChannels(ch);
+        setSelectedYear(latest);
+        api.getMonths(latest).then(m => { if (!cancelled) setAvailableMonths(m); });
+      });
+    }
     return () => { cancelled = true; };
   }, []);
 
@@ -251,7 +274,7 @@ export default function CustomerPage() {
     return (
       <span
         style={{ color: delta.type === "up" ? "#52c41a" : "#ff4d4f", fontSize: 12, cursor: "default" }}
-        title={delta.absDelta != null ? `绝对值：${delta.absDelta >= 0 ? "+" : ""}${numFmt(Math.abs(delta.absDelta))}` : undefined}
+        title={delta.absDelta != null ? (delta.absDelta < 0 ? `减少：${numFmt(Math.abs(delta.absDelta))}` : `增加：+${numFmt(delta.absDelta)}`) : undefined}
       >
         {delta.text}
       </span>
@@ -359,7 +382,9 @@ export default function CustomerPage() {
     const clickedName = params.name;
     const clickedRow = ranking.find(r => r.company_name === clickedName);
     if (clickedRow) {
-      setSelectedCustomerInTable(selectedCustomerInTable === clickedRow.company_id ? null : clickedRow.company_id);
+      const next = selectedCustomerInTable === clickedRow.company_id ? null : clickedRow.company_id;
+      setSelectedCustomerInTable(next);
+      setSelectedCompany(next);
     }
   };
 
@@ -390,7 +415,11 @@ export default function CustomerPage() {
         return (
           <span
             style={{ color: selectedCustomerInTable === row.company_id ? "#1677ff" : undefined, cursor: "pointer", fontWeight: selectedCustomerInTable === row.company_id ? 600 : 400 }}
-            onClick={() => setSelectedCustomerInTable(selectedCustomerInTable === row.company_id ? null : row.company_id)}
+            onClick={() => {
+              const next = selectedCustomerInTable === row.company_id ? null : row.company_id;
+              setSelectedCustomerInTable(next);
+              setSelectedCompany(next);
+            }}
           >
             {selectedCustomerInTable === row.company_id ? <Badge color="blue" text={v} /> : tag}{" "}{v}
           </span>
@@ -484,9 +513,9 @@ export default function CustomerPage() {
       {/* ① 筛选栏（始终固定顶部） */}
       <Card bordered={false} style={{ marginBottom: 16, position: "sticky", top: 64, zIndex: 100 }}>
         <FilterBar
-          years={years} selectedYear={selectedYear} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); }}
-          selectedPeriod={selectedPeriod} onPeriodChange={p => { setSelectedPeriod(p); }}
-          channels={channels} selectedChannel={selectedChannel} onChannelChange={v => { setSelectedChannel(v); if (!v) setSelectedCompany(null); }}
+          years={years} selectedYear={selectedYear} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); setRankingGrowthSort(null); }}
+          selectedPeriod={selectedPeriod} onPeriodChange={p => { setSelectedPeriod(p); setRankingGrowthSort(null); }}
+          channels={channels} selectedChannel={selectedChannel} onChannelChange={v => { setSelectedChannel(v); if (!v) setSelectedCompany(null); setRankingGrowthSort(null); }}
           companies={companies} selectedCompany={selectedCompany} onCompanyChange={setSelectedCompany}
           showCompany={true}
           availableMonths={availableMonths}
@@ -568,7 +597,7 @@ export default function CustomerPage() {
                   mode="multiple"
                   size="small"
                   value={currentVisible}
-                  onChange={v => setVisibleColumns(v)}
+                  onChange={v => { setVisibleColumns(v); try { localStorage.setItem("custpage_visible_cols", JSON.stringify(v)); } catch {} }}
                   style={{ minWidth: 160 }}
                   options={ALL_COLUMNS.map(c => ({ label: c.label, value: c.key }))}
                   maxTagCount={2}
@@ -591,7 +620,11 @@ export default function CustomerPage() {
               size="small"
               rowClassName={row => selectedCustomerInTable === row.company_id ? "ant-table-row-selected" : ""}
               onRow={row => ({
-                onClick: () => setSelectedCustomerInTable(selectedCustomerInTable === row.company_id ? null : row.company_id),
+                onClick: () => {
+                  const next = selectedCustomerInTable === row.company_id ? null : row.company_id;
+                  setSelectedCustomerInTable(next);
+                  setSelectedCompany(next);
+                },
                 style: { cursor: "pointer" },
               })}
             />

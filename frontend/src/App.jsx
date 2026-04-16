@@ -76,7 +76,7 @@ export default function App() {
         </div>
       </Header>
       <Content>
-        {isUserManagement ? <UserManagement /> : activeTab === "dashboard" ? <DashboardPage /> : activeTab === "channel" ? <ChannelPage /> : <CustomerPage />}
+        {isUserManagement ? <UserManagement /> : activeTab === "dashboard" ? <DashboardPage /> : activeTab === "channel" ? <ChannelPage onNavigateToCustomer={() => setActiveTab("customer")} /> : <CustomerPage />}
       </Content>
     </Layout>
   );

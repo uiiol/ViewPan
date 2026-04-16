@@ -97,7 +97,7 @@ export default function FilterBar({
           filterOption={(input, opt) => opt.label.includes(input)}
           value={selectedCompany}
           onChange={onCompanyChange}
-          onDropdownVisibleChange={open => {
+          onOpenChange={open => {
             if (open) onCompanyChange && onCompanyChange(selectedCompany);
           }}
           options={(companies || []).map(c => ({ label: c.name, value: c.id }))}

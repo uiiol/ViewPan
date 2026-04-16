@@ -17,6 +17,9 @@ from app.models import CallRecord
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env"))
 
+today = date.today()
+yesterday = date.today() - __import__("datetime").timedelta(days=1)
+
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 
@@ -92,12 +95,17 @@ def get_monthly_trend(
 ):
     quarter_map = {"Q1": (1, 3), "Q2": (4, 6), "Q3": (7, 9), "Q4": (10, 12), "H1": (1, 6), "H2": (7, 12)}
     cond = [extract("year", CallRecord.call_date) == year]
+    m_start, m_end = None, None
     if quarter and quarter in quarter_map:
         m_start, m_end = quarter_map[quarter]
         cond.append(extract("month", CallRecord.call_date) >= m_start)
         cond.append(extract("month", CallRecord.call_date) <= m_end)
     elif month:
+        m_start, m_end = month, month
         cond.append(extract("month", CallRecord.call_date) == month)
+    elif year == 2026:
+        # 2026年：只返回到昨天所在月
+        cond.append(extract("month", CallRecord.call_date) <= yesterday.month)
     if company_id:
         cond.append(CallRecord.company_id == company_id)
     if channel_name:
@@ -116,10 +124,20 @@ def get_monthly_trend(
     if compare_year:
         prev_cond = [extract("year", CallRecord.call_date) == compare_year]
         if quarter and quarter in quarter_map:
+            # 季度筛选：同季度对比
             prev_cond.append(extract("month", CallRecord.call_date) >= m_start)
             prev_cond.append(extract("month", CallRecord.call_date) <= m_end)
         elif month:
+            # 月份筛选：当月对比
             prev_cond.append(extract("month", CallRecord.call_date) == month)
+        elif year == 2026:
+            # 2026年：对比 Jan 1 ~ 昨天 与 去年同期同天
+            prev_cond.append(CallRecord.call_date >= f"{compare_year}-01-01")
+            prev_cond.append(CallRecord.call_date <= f"{compare_year}-{yesterday.month:02d}-{yesterday.day:02d}")
+        else:
+            # 过去年份：对比整年
+            prev_cond.append(CallRecord.call_date >= f"{compare_year}-01-01")
+            prev_cond.append(CallRecord.call_date <= f"{compare_year}-12-31")
         if company_id:
             prev_cond.append(CallRecord.company_id == company_id)
         if channel_name:
@@ -266,13 +284,30 @@ def get_company_ranking(
     # 如果需要增长率排序，查去年同期数据
     prev_metric_key = f"prev_{metric}"
     use_growth = sort_by_growth in ("growth_desc", "shrink_desc")
-    # custom date range 时也用去年同周期做对比
+    # 对比逻辑：
+    # - 有 quarter/month 过滤时不对比（用 metric 直接排序）
+    # - 2024年（数据库最早年份）无同期数据，不对比
+    # - 2025年：对比2024全年
+    # - 2026年起：对比 Jan 1 ~ 昨天 与 去年 Jan 1 ~ 去年同一日期
     prev_year_for_compare = compare_year if compare_year else (year - 1 if not (quarter or month) else None)
 
     # 预查去年同期（仅当使用增长率排序时）
     prev_data_map = {}
     if use_growth and prev_year_for_compare:
-        prev_cond = _build_cond(prev_year_for_compare, channel_name, quarter, month, start_date, end_date)
+        if year == 2024:
+            prev_data_map = {}  # 无同期，不查
+        elif year == 2026 and not (start_date or end_date or quarter or month):
+            # 2026年起：对比 Jan 1 ~ 昨天 与 去年同期
+            prev_start = f"{year - 1}-01-01"
+            prev_end = f"{year - 1}-{yesterday.month:02d}-{yesterday.day:02d}"
+            prev_cond = _build_cond(prev_year_for_compare, channel_name, quarter, month, prev_start, prev_end)
+        else:
+            # 2025年或过去年份：对比整年（过去年份用12-31，当前年用昨天）
+            if year < today.year:
+                prev_end_str = f"{prev_year_for_compare}-12-31"
+            else:
+                prev_end_str = f"{prev_year_for_compare}-{yesterday.month:02d}-{yesterday.day:02d}"
+            prev_cond = _build_cond(prev_year_for_compare, channel_name, quarter, month, f"{prev_year_for_compare}-01-01", prev_end_str)
         prev_q = db.query(
             CallRecord.company_id,
             func.sum(CallRecord.total_calls).label("total_calls"),
@@ -352,26 +387,40 @@ def get_channel_ranking(
     metric: str = Query("call_minutes"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
+    compare_year: Optional[int] = Query(None),
+    sort_by_growth: Optional[str] = Query(None, description="growth_desc|shrink_desc"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """
+    sort_by_growth:
+      - 'growth_desc' = 增长最快（增长率正序排，高的在前）
+      - 'shrink_desc' = 萎缩最大（增长率负序排，降幅大的在前）
+      - None = 按 metric 原始值排序
+    对比逻辑同 get_company_ranking：2024无对比，2025全年，2026起 Jan 1~昨天 vs 去年同期
+    """
     quarter_map = {"Q1": (1, 3), "Q2": (4, 6), "Q3": (7, 9), "Q4": (10, 12), "H1": (1, 6), "H2": (7, 12)}
     metric_col = {
         "call_minutes": func.sum(CallRecord.call_minutes),
         "total_calls": func.sum(CallRecord.total_calls),
         "connected_calls": func.sum(CallRecord.connected_calls),
     }.get(metric, func.sum(CallRecord.call_minutes))
-    cond = [extract("year", CallRecord.call_date) == year]
-    if quarter and quarter in quarter_map:
-        m_start, m_end = quarter_map[quarter]
-        cond.append(extract("month", CallRecord.call_date) >= m_start)
-        cond.append(extract("month", CallRecord.call_date) <= m_end)
-    elif month:
-        cond.append(extract("month", CallRecord.call_date) == month)
-    elif start_date:
-        cond.append(CallRecord.call_date >= start_date)
-        if end_date:
-            cond.append(CallRecord.call_date <= end_date)
+
+    def _build_cond(yr, q=None, m=None, sd=None, ed=None):
+        c = [extract("year", CallRecord.call_date) == yr]
+        if q and q in quarter_map:
+            ms, me = quarter_map[q]
+            c.append(extract("month", CallRecord.call_date) >= ms)
+            c.append(extract("month", CallRecord.call_date) <= me)
+        elif m:
+            c.append(extract("month", CallRecord.call_date) == m)
+        elif sd:
+            c.append(CallRecord.call_date >= sd)
+            if ed:
+                c.append(CallRecord.call_date <= ed)
+        return c
+
+    cond = _build_cond(year, quarter, month, start_date, end_date)
     q = db.query(
         CallRecord.channel_name,
         func.sum(CallRecord.total_calls).label("total_calls"),
@@ -380,8 +429,40 @@ def get_channel_ranking(
         func.avg(CallRecord.connect_rate).label("avg_connect_rate"),
         func.sum(CallRecord.intent_a + CallRecord.intent_b).label("ab_intent"),
     ).filter(and_(*cond)).group_by(CallRecord.channel_name)
-    q = q.order_by(metric_col.desc())
+
+    if sort_by_growth:
+        q = q.order_by(metric_col.desc())
+    else:
+        q = q.order_by(metric_col.desc())
     rows = q.all()
+
+    prev_metric_key = f"prev_{metric}"
+    use_growth = sort_by_growth in ("growth_desc", "shrink_desc")
+    prev_year_for_compare = compare_year if compare_year else (year - 1 if not (quarter or month) else None)
+
+    prev_data_map = {}
+    if use_growth and prev_year_for_compare:
+        if year == 2024:
+            prev_data_map = {}
+        elif year == 2026:
+            prev_start = f"{year - 1}-01-01"
+            prev_end = f"{year - 1}-{yesterday.month:02d}-{yesterday.day:02d}"
+            prev_cond = _build_cond(prev_year_for_compare, quarter, month, prev_start, prev_end)
+        else:
+            if year < today.year:
+                prev_end_str = f"{prev_year_for_compare}-12-31"
+            else:
+                prev_end_str = f"{prev_year_for_compare}-{yesterday.month:02d}-{yesterday.day:02d}"
+            prev_cond = _build_cond(prev_year_for_compare, quarter, month, f"{prev_year_for_compare}-01-01", prev_end_str)
+        prev_q = db.query(
+            CallRecord.channel_name,
+            func.sum(CallRecord.total_calls).label("total_calls"),
+            func.sum(CallRecord.connected_calls).label("connected_calls"),
+            func.sum(CallRecord.call_minutes).label("call_minutes"),
+        ).filter(and_(*prev_cond)).group_by(CallRecord.channel_name)
+        for row in prev_q.all():
+            prev_data_map[row.channel_name] = row._asdict()
+
     result = []
     for row in rows:
         d = row._asdict()
@@ -389,8 +470,148 @@ def get_channel_ranking(
             d["intent_rate"] = round(d["ab_intent"] / d["connected_calls"], 6)
         else:
             d["intent_rate"] = None
+
+        prev = prev_data_map.get(row.channel_name, {})
+        d[prev_metric_key] = prev.get(metric) if prev else None
+
+        curr_val = d.get(metric)
+        prev_val = d[prev_metric_key]
+        if curr_val and prev_val and prev_val != 0:
+            d["growth_rate"] = (curr_val - prev_val) / prev_val
+        elif curr_val and not prev_val:
+            d["growth_rate"] = None
+        else:
+            d["growth_rate"] = None
+
         result.append(d)
+
+    if sort_by_growth == "growth_desc":
+        result.sort(key=lambda x: (x["growth_rate"] is not None, x["growth_rate"] or 0), reverse=True)
+    elif sort_by_growth == "shrink_desc":
+        result.sort(key=lambda x: (x["growth_rate"] is not None, x["growth_rate"] or 0))
+
     return result
+
+
+@router.get("/channels/concentration")
+def get_channel_concentration(
+    year: int = Query(2025),
+    quarter: Optional[str] = Query(None),
+    month: Optional[int] = Query(None),
+    metric: str = Query("call_minutes"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    二八法则：前20%渠道占消耗百分比
+    头部渠道：月均通话分钟数 > 20万
+    尾部渠道：月均通话分钟数 < 1万
+    """
+    quarter_map = {"Q1": (1, 3), "Q2": (4, 6), "Q3": (7, 9), "Q4": (10, 12), "H1": (1, 6), "H2": (7, 12)}
+
+    def _build_cond(yr, sd=None, ed=None):
+        c = [extract("year", CallRecord.call_date) == yr]
+        if sd:
+            c.append(CallRecord.call_date >= sd)
+        if ed:
+            c.append(CallRecord.call_date <= ed)
+        return c
+
+    cond = _build_cond(year, start_date, end_date)
+
+    # 计算周期内的月份数
+    period_months = 12
+    if quarter and quarter in quarter_map:
+        m_start, m_end = quarter_map[quarter]
+        period_months = m_end - m_start + 1
+        cond.append(extract("month", CallRecord.call_date) >= m_start)
+        cond.append(extract("month", CallRecord.call_date) <= m_end)
+    elif month:
+        period_months = 1
+        cond.append(extract("month", CallRecord.call_date) == month)
+
+    # 渠道总量
+    channel_total_q = db.query(
+        CallRecord.channel_name,
+        func.sum(CallRecord.call_minutes).label("call_minutes"),
+        func.sum(CallRecord.total_calls).label("total_calls"),
+        func.sum(CallRecord.connected_calls).label("connected_calls"),
+    ).filter(and_(*cond)).group_by(CallRecord.channel_name)
+    channel_totals = {row.channel_name: float(getattr(row, metric) or 0) for row in channel_total_q.all()}
+    total_sum = sum(channel_totals.values())
+    channels_count = len(channel_totals)
+
+    # 二八法则：前20%渠道贡献
+    sorted_channels = sorted(channel_totals.items(), key=lambda x: x[1], reverse=True)
+    top20_pct_count = max(1, int(channels_count * 0.2))
+    cumulate = 0
+    top20_channels = []
+    total_for_pct = total_sum if total_sum > 0 else 1
+    for i, (ch_name, val) in enumerate(sorted_channels):
+        cumulate += val
+        if i < top20_pct_count:
+            top20_channels.append(ch_name)
+    top20_contribution = cumulate / total_for_pct
+
+    # 单客户撑起（TOP1客户占比>50%）— 一次查询搞定
+    metric_col_map = {
+        "call_minutes": func.sum(CallRecord.call_minutes),
+        "total_calls": func.sum(CallRecord.total_calls),
+        "connected_calls": func.sum(CallRecord.connected_calls),
+    }
+    metric_col = metric_col_map.get(metric, func.sum(CallRecord.call_minutes))
+    # 单客户撑起（TOP1客户占比>50%）
+    # 先按渠道+客户聚合，再取每个渠道的TOP1客户
+    ch_cust_q = db.query(
+        CallRecord.channel_name,
+        CallRecord.company_name,
+        metric_col.label("val"),
+    ).filter(and_(*cond)).group_by(
+        CallRecord.channel_name, CallRecord.company_name
+    ).order_by(CallRecord.channel_name, metric_col.desc()).all()
+
+    top1_map = {}
+    last_ch = None
+    for row in ch_cust_q:
+        if row.channel_name != last_ch:
+            top1_map[row.channel_name] = float(row.val or 0)
+            last_ch = row.channel_name
+
+    single_cust_channels = []
+    for ch_name, ch_total in channel_totals.items():
+        top1_val = top1_map.get(ch_name, 0)
+        if ch_total > 0 and top1_val / ch_total > 0.5:
+            single_cust_channels.append(ch_name)
+
+    # 头部渠道（月均 > 20万）、尾部渠道（月均 < 1万）
+    head_channels, tail_channels = [], []
+    for ch_name, ch_total in channel_totals.items():
+        monthly_avg = ch_total / period_months
+        if monthly_avg > 200000:
+            head_channels.append(ch_name)
+        elif monthly_avg < 10000:
+            tail_channels.append(ch_name)
+
+    # 覆盖客户总数（去重）
+    cust_q = db.query(CallRecord.company_id).filter(and_(*cond))
+    total_companies = cust_q.distinct().count()
+
+    return {
+        "total_channels": channels_count,
+        "total_companies": total_companies,
+        "top20_pct": round(top20_contribution, 4),
+        "top20_channel_count": top20_pct_count,
+        "top20_channels": top20_channels,
+        "head_channel_count": len(head_channels),
+        "head_channels": head_channels,
+        "tail_channel_count": len(tail_channels),
+        "tail_channels": tail_channels,
+        "single_cust_channel_count": len(single_cust_channels),
+        "single_cust_channels": single_cust_channels,
+        "period_months": period_months,
+    }
 
 
 @router.get("/dashboard/summary")
