@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useRef } from "react";
-import { Row, Col, Card, Select } from "antd";
+import { Row, Col, Card, Select, Switch } from "antd";
 import { RiseOutlined, FallOutlined, WarningOutlined } from "@ant-design/icons";
 import * as echarts from "echarts";
 import * as api from "../api";
@@ -47,6 +47,7 @@ export default function DashboardPage() {
   const [selectedYear, setSelectedYear] = useState(null);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [cumulativeView, setCumulativeView] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,19 +117,75 @@ export default function DashboardPage() {
   const prevMins = data.monthly_data.map(d => { prevCum += d.prev_call_minutes; return prevCum; });
   const targetLine = months.map((_, i) => targetMonthly * (i + 1));
 
+  const currData = cumulativeView ? currMins : data.monthly_data.map(d => d.call_minutes);
+  const prevData = cumulativeView ? prevMins : data.monthly_data.map(d => d.prev_call_minutes);
+
+  // 差距：同比增长率百分比
+  const gapPct = cumulativeView ? currMins.map((v, i) => {
+    const m = data.monthly_data[i];
+    if (!m || m.call_minutes <= 0 || !prevMins[i]) return null;
+    return ((v - prevMins[i]) / prevMins[i]) * 100;
+  }) : [];
+
+  // 累计同比涨幅/跌幅用于图例
+  const totalCurr = currMins[currMins.length - 1] || 0;
+  const totalPrev = prevMins[prevMins.length - 1] || 0;
+  const overallGapPct = totalCurr > 0 && totalPrev > 0 ? ((totalCurr - totalPrev) / totalPrev) * 100 : 0;
+
   const monthlyTrendOption = {
-    tooltip: { trigger: "axis" },
+    tooltip: {
+      trigger: "axis",
+      formatter: params => {
+        const month = params[0].axisValue;
+        const rows = [];
+        const gapParam = params.find(p => p.seriesName.includes("同比"));
+        params.forEach(p => {
+          if (p.value == null) return;
+          if (p.seriesName.includes("同比")) return;
+          rows.push(`${p.marker} ${p.seriesName}：${numFmt(p.value)}`);
+        });
+        if (gapParam) {
+          const v = gapParam.value;
+          const num = typeof v === "object" ? v?.value : v;
+          if (num != null) {
+            const color = num >= 0 ? "#52c41a" : "#ff4d4f";
+            const sign = num >= 0 ? "+" : "";
+            rows.push(`<span style="color:${color}">●</span> 对比差距：${sign}${num.toFixed(2)}%`);
+          }
+        }
+        return `<div style="font-size:11"><strong>${month}</strong><br/>${rows.join("<br/>")}</div>`;
+      },
+    },
     legend: {
-      data: [`${selectedYear}年累计`, `${selectedYear - 1}年同期累计`, "目标累计线"],
+      data: cumulativeView
+        ? [
+            `${selectedYear}年累计`,
+            `${selectedYear - 1}年同期累计`,
+            "目标累计线",
+            overallGapPct >= 0 ? `同比涨幅  +${overallGapPct.toFixed(2)}%` : `同比跌幅  ${overallGapPct.toFixed(2)}%`,
+          ]
+        : [`${selectedYear}年`, `${selectedYear - 1}年同期`, "目标月均线"],
       top: 0,
     },
     grid: { left: 65, right: 30, bottom: 28, top: 38 },
     xAxis: { type: "category", data: months },
-    yAxis: { type: "value", name: "通话分钟数", axisLabel: { formatter: v => numFmt(v) } },
-    series: [
-      { name: `${selectedYear}年累计`, type: "line", data: currMins, itemStyle: { color: "#5470c6" }, smooth: true, areaStyle: { color: "rgba(84,112,198,0.15)" } },
-      { name: `${selectedYear - 1}年同期累计`, type: "line", data: prevMins, itemStyle: { color: "#aaa" }, smooth: true, lineStyle: { type: "dashed" } },
-      { name: "目标月均线", type: "line", data: targetLine, itemStyle: { color: "#ee6666" }, smooth: false, symbol: "none", lineStyle: { type: "dashed", width: 1 } },
+    yAxis: cumulativeView
+      ? { type: "value", name: "通话分钟数", axisLabel: { formatter: v => numFmt(v) }, splitLine: { show: false } }
+      : { type: "value", name: "通话分钟数", axisLabel: { formatter: v => numFmt(v) } },
+    series: cumulativeView ? [
+      { name: `${selectedYear - 1}年同期累计`, type: "line", data: prevMins, itemStyle: { color: "#bbb" }, smooth: true, lineStyle: { type: "dashed", width: 2 }, symbol: "none" },
+      { name: `${selectedYear}年累计`, type: "line", data: currMins, itemStyle: { color: "#5470c6" }, smooth: true, symbol: "none", areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: "rgba(84,112,198,0.4)" }, { offset: 1, color: "rgba(84,112,198,0.05)" }]) } },
+      { name: "目标累计线", type: "line", data: targetLine, itemStyle: { color: "#ee6666" }, smooth: false, symbol: "none", lineStyle: { type: "dashed", width: 1 } },
+      {
+        name: overallGapPct >= 0 ? `同比涨幅  +${overallGapPct.toFixed(2)}%` : `同比跌幅  ${overallGapPct.toFixed(2)}%`,
+        type: "bar",
+        data: gapPct.map(v => v != null ? { value: v, itemStyle: { color: v >= 0 ? "#52c41a" : "#ff4d4f" } } : { value: null }),
+        barWidth: 18,
+      },
+    ] : [
+      { name: `${selectedYear}年`, type: "bar", data: currData, itemStyle: { color: "#5470c6" } },
+      { name: `${selectedYear - 1}年同期`, type: "bar", data: prevData, itemStyle: { color: "#ccc" } },
+      { name: "目标月均线", type: "line", data: months.map(() => targetMonthly), itemStyle: { color: "#ee6666" }, smooth: false, symbol: "none", lineStyle: { type: "dashed", width: 1 } },
     ],
   };
 
@@ -148,41 +205,66 @@ export default function DashboardPage() {
   })();
 
   const customerPieOption = (() => {
+    const newCount = data.new_cust_count || 0;
+    const returnCount = data.return_cust_count || 0;
+    const lostSamePeriod = data.lost_same_period_count || 0;
+    const lostNoPeriod = data.lost_no_period_count || 0;
+    const newMins = data.new_cust_minutes || 0;
+    const returnMins = data.return_minutes || 0;
+    const totalMins = newMins + returnMins;
+    // 外圈总数作为分母
+    const outerTotal = newCount + returnCount + lostSamePeriod + lostNoPeriod || 1;
+
     return {
-      tooltip: { formatter: "{b}: {d}% ({c})" },
-      legend: { orient: "vertical", left: 5, top: "center" },
-      series: [{
-        type: "pie",
-        radius: ["30%", "60%"],
-        center: ["55%", "50%"],
+      tooltip: {
+        trigger: "item",
+        formatter: p => {
+          if (p.seriesIndex === 0) return `${p.marker} ${p.name}<br/>通话分钟数：${numFmt(p.value)} 分钟`;
+          return `${p.marker} ${p.name}<br/>客户数量：${p.value} 人（${((p.value / outerTotal) * 100).toFixed(1)}%）`;
+        },
+      },
+      legend: {
+        orient: "vertical", right: 5, top: "center",
+        itemWidth: 10, itemHeight: 10,
         data: [
-          { name: "新客户", value: data.new_cust_minutes, itemStyle: { color: "#5470c6" } },
-          { name: "老客户", value: data.return_minutes, itemStyle: { color: "#91cc75" } },
-          { name: "流失客户", value: data.churn_cust_minutes, itemStyle: { color: "#ff7875" } },
+          { name: `● 新客户  ${newCount}人（${((newCount / outerTotal) * 100).toFixed(1)}%）`, icon: "circle" },
+          { name: `● 老客户  ${returnCount}人（${((returnCount / outerTotal) * 100).toFixed(1)}%）`, icon: "circle" },
+          { name: `● 同期有外呼  ${lostSamePeriod}人（${((lostSamePeriod / outerTotal) * 100).toFixed(1)}%）`, icon: "circle" },
+          { name: `● 同期没外呼  ${lostNoPeriod}人（${((lostNoPeriod / outerTotal) * 100).toFixed(1)}%）`, icon: "circle" },
         ],
-        label: { formatter: "{b}\n{d}%", fontSize: 11 },
-        emphasis: { label: { show: true, fontSize: 13, fontWeight: "bold" } },
-      }],
+        textStyle: { fontSize: 11 },
+      },
+      series: [
+        {
+          type: "pie",
+          radius: ["0%", "42%"],
+          center: ["45%", "50%"],
+          data: [
+            { name: `新客户`, value: newMins, itemStyle: { color: "#5470c6" } },
+            { name: `老客户`, value: returnMins, itemStyle: { color: "#91cc75" } },
+          ],
+          label: { show: false },
+          emphasis: { scaleSize: 6 },
+          animationDuration: 800,
+        },
+        {
+          type: "pie",
+          radius: ["46%", "85%"],
+          center: ["45%", "50%"],
+          data: [
+            { name: `新客户`, value: newCount, itemStyle: { color: "#5470c6" } },
+            { name: `老客户`, value: returnCount, itemStyle: { color: "#91cc75" } },
+            { name: `同期有外呼`, value: lostSamePeriod, itemStyle: { color: "#ff7875" } },
+            { name: `同期没外呼`, value: lostNoPeriod, itemStyle: { color: "#fa8c16" } },
+          ],
+          label: { show: false },
+          emphasis: { scaleSize: 6 },
+          animationDuration: 800,
+        },
+      ],
+      graphic: { type: "group", children: [] },
     };
   })();
-
-  const channelColors = ["#5470c6", "#fac858", "#91cc75", "#ee6666", "#73c0de", "#ff9f7f"];
-  const channelPieOption = {
-    tooltip: { formatter: "{b}: {d}% ({c})" },
-    legend: { orient: "vertical", left: 5, top: "center" },
-    series: [{
-      type: "pie",
-      radius: ["30%", "60%"],
-      center: ["55%", "50%"],
-      data: data.channel_breakdown.slice(0, 6).map((c, i) => ({
-        name: c.channel_name,
-        value: c.call_minutes,
-        itemStyle: { color: channelColors[i % 6] },
-      })),
-      label: { formatter: "{b}\n{d}%", fontSize: 10 },
-      emphasis: { label: { show: true, fontSize: 12, fontWeight: "bold" } },
-    }],
-  };
 
   const scatterOption = (() => {
     const scatter = data.scatter_data || [];
@@ -344,7 +426,17 @@ export default function DashboardPage() {
       {/* Row 2 */}
       <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
         <Col xs={24} md={12}>
-          <Card title="月度趋势（通话分钟数）" bordered={false} bodyStyle={{ paddingBottom: 8 }}>
+          <Card
+            title="月度趋势（通话分钟数）"
+            bordered={false}
+            bodyStyle={{ paddingBottom: 8 }}
+            extra={
+              <span style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                累计
+                <Switch size="small" checked={cumulativeView} onChange={v => setCumulativeView(v)} />
+              </span>
+            }
+          >
             <EChart option={monthlyTrendOption} style={{ height: ROW_H - 20 }} />
           </Card>
         </Col>
@@ -357,17 +449,24 @@ export default function DashboardPage() {
 
       {/* Row 3 */}
       <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-        <Col xs={24} md={10}>
-          <Card title="客户结构（新老客户）" bordered={false} bodyStyle={{ paddingBottom: 8 }}>
+        <Col xs={24} md={12}>
+          <Card
+            title="客户结构"
+            bordered={false}
+            bodyStyle={{ paddingBottom: 8 }}
+            extra={
+              <span style={{ fontSize: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <span><span style={{ color: "#5470c6", fontWeight: 600 }}>●</span> 新客户 {data.new_cust_count}人</span>
+                <span><span style={{ color: "#91cc75", fontWeight: 600 }}>●</span> 老客户 {data.return_cust_count}人</span>
+                <span><span style={{ color: "#ff7875", fontWeight: 600 }}>●</span> 同期有外呼 {data.lost_same_period_count}人</span>
+                <span><span style={{ color: "#fa8c16", fontWeight: 600 }}>●</span> 同期没外呼 {data.lost_no_period_count}人</span>
+              </span>
+            }
+          >
             <EChart option={customerPieOption} style={{ height: ROW_H - 20 }} />
-            <div style={{ textAlign: "center", fontSize: 11, color: "#888", marginTop: 2 }}>
-              <span style={{ color: "#5470c6" }}>●</span> 新客户 {pctFmt(data.new_cust_minutes / (data.new_cust_minutes + data.return_minutes + data.churn_cust_minutes))} &nbsp;
-              <span style={{ color: "#91cc75" }}>●</span> 老客户 {pctFmt(data.return_minutes / (data.new_cust_minutes + data.return_minutes + data.churn_cust_minutes))} &nbsp;
-              <span style={{ color: "#ff7875" }}>●</span> 流失客户 {pctFmt(data.churn_cust_minutes / (data.new_cust_minutes + data.return_minutes + data.churn_cust_minutes))}
-            </div>
           </Card>
         </Col>
-        <Col xs={24} md={14}>
+        <Col xs={24} md={12}>
           <Card
             title="客户健康度（同期对比）"
             extra={<span style={{ fontSize: 10 }}><span style={{ color: "#52c41a" }}>●</span> 增长&nbsp;<span style={{ color: "#5470c6" }}>●</span> 新客户&nbsp;<span style={{ color: "#ff4d4f" }}>●</span> 萎缩</span>}

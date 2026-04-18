@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { Row, Col, Card, Table, Segmented, Badge, Select, Button } from "antd";
+import { Row, Col, Card, Table, Segmented, Badge, Select, Button, Collapse } from "antd";
 import { PhoneOutlined, CheckCircleOutlined, ClockCircleOutlined, RiseOutlined } from "@ant-design/icons";
 import { Statistic } from "antd";
 import FilterBar from "../components/FilterBar";
@@ -28,6 +28,12 @@ function deltaFmt(current, prev) {
   return { text: `${sign}${delta.toFixed(1)}%`, absDelta: current - prev, type: delta >= 0 ? "up" : "down" };
 }
 
+function pctChg(curr, prev) {
+  if (curr == null || prev == null || prev === 0) return "-";
+  const chg = ((curr - prev) / prev) * 100;
+  return `${chg >= 0 ? "+" : ""}${chg.toFixed(1)}%`;
+}
+
 function statsFromArr(arr, key) {
   const vals = arr.map(r => r[key]).filter(v => v != null && !isNaN(v)).sort((a, b) => a - b);
   if (!vals.length) return { median: null, q1: null, q3: null, avg: null };
@@ -52,7 +58,8 @@ export default function ChannelPage(props) {
   const [customEnd, setCustomEnd] = useState(null);
 
   const [rankingMetric, setRankingMetric] = useState("call_minutes");
-  const [rankingGrowthSort, setRankingGrowthSort] = useState(null);
+  const [rankingGrowthSortYoY, setRankingGrowthSortYoY] = useState(null); // "growth_desc" | "shrink_desc" | null
+  const [rankingGrowthSortQoQ, setRankingGrowthSortQoQ] = useState(null); // "growth_desc" | "shrink_desc" | null
   const [selectedChannelInTable, setSelectedChannelInTable] = useState(null);
 
   const [channelOverview, setChannelOverview] = useState(null);
@@ -62,6 +69,8 @@ export default function ChannelPage(props) {
   const [topCustomers, setTopCustomers] = useState([]);
   const [channelCompanies, setChannelCompanies] = useState([]); // 当前选中渠道的全部客户
   const [concentration, setConcentration] = useState(null);
+  const [monthlyConc, setMonthlyConc] = useState([]); // 每月详细数据（折叠展开用）
+  const [compMode, setCompMode] = useState("qoq"); // "qoq" 环比 | "yoy" 同比
 
   const navigate = useNavigate();
 
@@ -102,9 +111,27 @@ export default function ChannelPage(props) {
 
     const rankingParams = {
       year: selectedYear, quarter, month, metric: rankingMetric, limit: 0,
-      start_date: selectedPeriod === "custom" && customStart ? `${selectedYear}-${String(customStart).padStart(2, "0")}-01` : undefined,
-      end_date: selectedPeriod === "custom" && customEnd ? `${selectedYear}-${String(customEnd).padStart(2, "0")}-01` : undefined,
-      sort_by_growth: rankingGrowthSort,
+      start_date: (() => {
+        if (selectedPeriod === "custom" && customStart) return `${selectedYear}-${String(customStart).padStart(2, "0")}-01`;
+        if (month) {
+          return `${selectedYear}-${String(month).padStart(2, "0")}-01`;
+        }
+        return undefined;
+      })(),
+      end_date: (() => {
+        if (selectedPeriod === "custom" && customEnd) return `${selectedYear}-${String(customEnd).padStart(2, "0")}-01`;
+        if (month) {
+          const mStart = dayjs(`${selectedYear}-${String(month).padStart(2, "0")}-01`);
+          if (month === dayjs().month() + 1 && selectedYear === dayjs().year()) {
+            // current month: end_date = yesterday
+            return dayjs().subtract(1, "day").format("YYYY-MM-DD");
+          }
+          return mStart.endOf("month").format("YYYY-MM-DD");
+        }
+        return undefined;
+      })(),
+      sort_by_growth: rankingGrowthSortYoY,
+      sort_by_growth_qoq: rankingGrowthSortQoQ,
     };
     const concParams = { year: selectedYear, quarter, month, metric: rankingMetric,
       start_date: rankingParams.start_date, end_date: rankingParams.end_date };
@@ -121,7 +148,34 @@ export default function ChannelPage(props) {
     }).catch(() => { if (!abortCtrl.signal.aborted) setLoading(false); });
 
     return () => abortCtrl.abort();
-  }, [selectedYear, selectedPeriod, rankingMetric, rankingGrowthSort, customStart, customEnd]);
+  }, [selectedYear, selectedPeriod, rankingMetric, rankingGrowthSortYoY, rankingGrowthSortQoQ, customStart, customEnd]);
+
+  // 每月详细数据（折叠展开用）
+  useEffect(() => {
+    if (!selectedYear) return;
+    const currentMonth = new Date().getMonth() + 1;
+    const isCurrentYear = selectedYear === new Date().getFullYear();
+    const monthsToFetch = isCurrentYear
+      ? Array.from({ length: currentMonth }, (_, i) => i + 1)
+      : Array.from({ length: 12 }, (_, i) => i + 1);
+    const prevYear = selectedYear - 1;
+    Promise.all([
+      ...monthsToFetch.map(m =>
+        api.getChannelConcentration({ year: selectedYear, month: m, metric: rankingMetric })
+      ),
+      ...monthsToFetch.map(m =>
+        api.getChannelConcentration({ year: prevYear, month: m, metric: rankingMetric })
+      ),
+    ]).then(results => {
+      const curr = results.slice(0, monthsToFetch.length);
+      const prev = results.slice(monthsToFetch.length);
+      setMonthlyConc(curr.map((r, i) => ({
+        month: monthsToFetch[i],
+        ...r,
+        prevData: prev[i] || null,
+      })));
+    }).catch(() => setMonthlyConc([]));
+  }, [selectedYear, rankingMetric]);
 
   // 选中渠道商后，获取详情数据
   useEffect(() => {
@@ -241,7 +295,9 @@ export default function ChannelPage(props) {
   };
 
   const rankingStats = useMemo(() => statsFromArr(channelRanking, rankingMetric), [channelRanking, rankingMetric]);
-  const showGrowthCol = rankingGrowthSort != null;
+  const isYoYSort = rankingGrowthSortYoY != null;
+  const isQoQSort = rankingGrowthSortQoQ != null;
+  const showGrowthCol = isYoYSort || isQoQSort;
   const totalMetric = useMemo(() => channelRanking.reduce((s, r) => s + (r[rankingMetric] || 0), 0), [channelRanking, rankingMetric]);
   const top20Contribution = useMemo(() => {
     if (!channelRanking.length || !totalMetric) return 0;
@@ -257,7 +313,7 @@ export default function ChannelPage(props) {
     { key: "connected_calls", label: "接通量" },
     { key: "avg_connect_rate", label: "平均接通率" },
     { key: "intent_rate", label: "AB意向率" },
-    ...(showGrowthCol ? [{ key: "growth_rate", label: "同比增长率" }] : []),
+    ...(showGrowthCol ? [{ key: "growth_rate", label: isQoQSort ? "环比增长率" : "同比增长率" }] : []),
   ];
   const defaultVisible = ALL_COLUMNS.map(c => c.key);
   const currentVisible = visibleColumns || defaultVisible;
@@ -285,8 +341,9 @@ export default function ChannelPage(props) {
       dataIndex: rankingMetric,
       key: rankingMetric,
       render: (v, row) => {
+        const rate = isQoQSort ? row.qoq_growth_rate : row.growth_rate;
         const color = showGrowthCol
-          ? (row.growth_rate == null ? "#5470c6" : row.growth_rate >= 0 ? "#52c41a" : "#ff4d4f")
+          ? (rate == null ? "#5470c6" : rate >= 0 ? "#52c41a" : "#ff4d4f")
           : (rankingStats.q3 && row[rankingMetric] >= rankingStats.q3 ? "#52c41a" : rankingStats.q1 && row[rankingMetric] <= rankingStats.q1 ? "#ff4d4f" : "#5470c6");
         return <span style={{ color, fontWeight: color !== "#5470c6" ? 600 : 400 }}>{numFmt(v)}</span>;
       },
@@ -306,20 +363,22 @@ export default function ChannelPage(props) {
       align: "right",
     },
     ...(showGrowthCol ? [{
-      title: "同比增长率",
+      title: isQoQSort ? "环比增长率" : "同比增长率",
       key: "growth_rate",
       render: (_, row) => {
-        if (row.growth_rate == null) return <span style={{ color: "#aaa" }}>无同期</span>;
-        const sign = row.growth_rate >= 0 ? "+" : "";
-        const color = row.growth_rate >= 0 ? "#52c41a" : "#ff4d4f";
+        const isQoQ = isQoQSort;
+        const rate = isQoQ ? row.qoq_growth_rate : row.growth_rate;
+        const prevVal = isQoQ ? row.qoq_prev_value : row[`prev_${rankingMetric}`];
+        if (rate == null) return <span style={{ color: "#aaa" }}>无{isQoQ ? "上个周期" : "同期"}</span>;
+        const sign = rate >= 0 ? "+" : "";
+        const color = rate >= 0 ? "#52c41a" : "#ff4d4f";
         const curr = row[rankingMetric] || 0;
-        const prev = row[`prev_${rankingMetric}`] || 0;
-        const absDelta = curr - prev;
+        const absDelta = curr - (prevVal || 0);
         const absSign = absDelta >= 0 ? "+" : "";
-        const tooltip = `同比绝对值：${absSign}${numFmt(absDelta)}\n当期：${numFmt(curr)}\n同期：${numFmt(prev)}`;
+        const tooltip = `${isQoQ ? "环比" : "同比"}绝对值：${absSign}${numFmt(absDelta)}\n当期：${numFmt(curr)}\n${isQoQ ? "上个周期" : "同期"}：${numFmt(prevVal || 0)}`;
         return (
           <span style={{ color, fontWeight: 600, cursor: "default" }} title={tooltip}>
-            {sign}{(row.growth_rate * 100).toFixed(1)}%
+            {sign}{(rate * 100).toFixed(1)}%
           </span>
         );
       },
@@ -343,15 +402,31 @@ export default function ChannelPage(props) {
     { title: "同比", dataIndex: "intent_rate_yoy", key: "intent_rate_yoy", render: deltaTag, align: "right" },
   ];
 
+  const dailyColumns = [
+    { title: "日期", dataIndex: "date", key: "date", width: 90 },
+    { title: "外呼量", dataIndex: "total_calls", key: "total_calls", render: v => numFmt(v), align: "right" },
+    { title: "环比", dataIndex: "calls_delta", key: "calls_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "calls_yoy", key: "calls_yoy", render: deltaTag, align: "right" },
+    { title: "通话分钟数", dataIndex: "call_minutes", key: "call_minutes", render: v => numFmt(v), align: "right" },
+    { title: "环比", dataIndex: "minutes_delta", key: "minutes_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "minutes_yoy", key: "minutes_yoy", render: deltaTag, align: "right" },
+    { title: "接通率", dataIndex: "avg_connect_rate", key: "avg_connect_rate", render: v => pctFmt(v), align: "right" },
+    { title: "环比", dataIndex: "connect_rate_delta", key: "connect_rate_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "connect_rate_yoy", key: "connect_rate_yoy", render: deltaTag, align: "right" },
+    { title: "意向率", dataIndex: "intent_rate", key: "intent_rate", render: v => pctFmt(v), align: "right" },
+    { title: "环比", dataIndex: "intent_rate_delta", key: "intent_rate_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "intent_rate_yoy", key: "intent_rate_yoy", render: deltaTag, align: "right" },
+  ];
+
   const selectedChannelName = selectedChannelInTable || selectedChannel;
 
   return (
     <div style={{ padding: "20px 24px" }}>
       <Card bordered={false} style={{ marginBottom: 16, position: "sticky", top: 64, zIndex: 100 }}>
         <FilterBar
-          years={years} selectedYear={selectedYear} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); setRankingGrowthSort(null); }}
-          selectedPeriod={selectedPeriod} onPeriodChange={p => { setSelectedPeriod(p); setRankingGrowthSort(null); }}
-          channels={channels} selectedChannel={selectedChannel} onChannelChange={v => { setSelectedChannel(v); setRankingGrowthSort(null); }}
+          years={years} selectedYear={selectedYear} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); setRankingGrowthSortYoY(null); setRankingGrowthSortQoQ(null); }}
+          selectedPeriod={selectedPeriod} onPeriodChange={p => { setSelectedPeriod(p); setRankingGrowthSortYoY(null); setRankingGrowthSortQoQ(null); }}
+          channels={channels} selectedChannel={selectedChannel} onChannelChange={v => { setSelectedChannel(v); setRankingGrowthSortYoY(null); setRankingGrowthSortQoQ(null); }}
           availableMonths={availableMonths}
           customStart={customStart} customEnd={customEnd}
           onCustomRangeChange={(s, e) => { setCustomStart(s); setCustomEnd(e); }}
@@ -367,49 +442,175 @@ export default function ChannelPage(props) {
               <Row gutter={[12, 8]}>
                 <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>外呼渠道数</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: "#5470c6" }}>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: "#5470c6", cursor: "default" }}
+                    title={`当期：${concentration.total_channels} 渠道\n环比：${concentration.qoq_channels_count ?? "-"}${concentration.qoq_channels_count != null ? ` (${pctChg(concentration.total_channels, concentration.qoq_channels_count)})` : ""}\n同比：${concentration.prev_channels_count ?? "-"}${concentration.prev_channels_count != null ? ` (${pctChg(concentration.total_channels, concentration.prev_channels_count)})` : ""}`}
+                  >
                     {concentration.total_channels}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>渠道总数</div>
                 </Col>
                 <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>二八法则</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: top20Contribution >= 0.8 ? "#ff4d4f" : top20Contribution >= 0.5 ? "#fa8c16" : "#52c41a" }}>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: top20Contribution >= 0.8 ? "#ff4d4f" : top20Contribution >= 0.5 ? "#fa8c16" : "#52c41a", cursor: "default" }}
+                    title={`当期：${(top20Contribution * 100).toFixed(1)}%\n环比：${((concentration.qoq_top20_contribution || 0) * 100).toFixed(1)}%${concentration.qoq_top20_contribution != null ? ` (${pctChg(top20Contribution, concentration.qoq_top20_contribution)})` : ""}\n同比：${((concentration.prev_top20_contribution || 0) * 100).toFixed(1)}%${concentration.prev_top20_contribution != null ? ` (${pctChg(top20Contribution, concentration.prev_top20_contribution)})` : ""}`}
+                  >
                     {(top20Contribution * 100).toFixed(1)}%
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>前20名渠道占分钟数</div>
                 </Col>
                 <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>单客户撑起</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: concentration.single_cust_channel_count > 0 ? "#ff4d4f" : "#52c41a" }}>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: concentration.single_cust_channel_count > 0 ? "#ff4d4f" : "#52c41a", cursor: "default" }}
+                    title={`当期：${concentration.single_cust_channel_count} 渠道\n环比：${concentration.qoq_single_cust_count ?? "-"}${concentration.qoq_single_cust_count != null ? ` (${pctChg(concentration.single_cust_channel_count, concentration.qoq_single_cust_count)})` : ""}\n同比：${concentration.prev_single_cust_count ?? "-"}${concentration.prev_single_cust_count != null ? ` (${pctChg(concentration.single_cust_channel_count, concentration.prev_single_cust_count)})` : ""}`}
+                  >
                     {concentration.single_cust_channel_count}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>单客占比&gt;50%渠道数</div>
                 </Col>
                 <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>头部渠道</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: concentration.head_channel_count > 0 ? "#ff4d4f" : "#52c41a" }}>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: concentration.head_channel_count > 0 ? "#ff4d4f" : "#52c41a", cursor: "default" }}
+                    title={`当期：${concentration.head_channel_count} 渠道\n环比：${concentration.qoq_head_count ?? "-"}${concentration.qoq_head_count != null ? ` (${pctChg(concentration.head_channel_count, concentration.qoq_head_count)})` : ""}\n同比：${concentration.prev_head_count ?? "-"}${concentration.prev_head_count != null ? ` (${pctChg(concentration.head_channel_count, concentration.prev_head_count)})` : ""}`}
+                  >
                     {concentration.head_channel_count}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>月均 &gt; 20万分钟</div>
                 </Col>
                 <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>尾部渠道</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: concentration.tail_channel_count > 0 ? "#fa8c16" : "#52c41a" }}>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: concentration.tail_channel_count > 0 ? "#fa8c16" : "#52c41a", cursor: "default" }}
+                    title={`当期：${concentration.tail_channel_count} 渠道\n环比：${concentration.qoq_tail_count ?? "-"}${concentration.qoq_tail_count != null ? ` (${pctChg(concentration.tail_channel_count, concentration.qoq_tail_count)})` : ""}\n同比：${concentration.prev_tail_count ?? "-"}${concentration.prev_tail_count != null ? ` (${pctChg(concentration.tail_channel_count, concentration.prev_tail_count)})` : ""}`}
+                  >
                     {concentration.tail_channel_count}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>月均 &lt; 1万分钟</div>
                 </Col>
                 <Col span={4}>
                   <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>流失渠道</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: concentration.churn_channel_count > 0 ? "#ff4d4f" : "#52c41a" }}>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: concentration.churn_channel_count > 0 ? "#ff4d4f" : "#52c41a" }}
+                  >
                     {concentration.churn_channel_count}
                   </div>
                   <div style={{ fontSize: 11, color: "#aaa" }}>去年有今无</div>
                 </Col>
               </Row>
+              <Row gutter={[12, 8]} style={{ marginTop: 8 }}>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>新增渠道</div>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: concentration.new_channel_count > 0 ? "#52c41a" : "#5470c6" }}
+                  >
+                    {concentration.new_channel_count}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>去年无今有</div>
+                </Col>
+              </Row>
             </Card>
           )}
+
+          {monthlyConc.length > 0 && (
+            <Card bordered={false} size="small">
+              <Collapse
+                ghost
+                items={[{
+                  key: "monthly",
+                  label: (
+                    <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 13, color: "#888" }}>📊 每月详细数据</span>
+                      <Segmented
+                        size="small"
+                        value={compMode}
+                        onChange={v => setCompMode(v)}
+                        options={[
+                          { label: "环比", value: "qoq" },
+                          { label: "同比", value: "yoy" },
+                        ]}
+                      />
+                    </span>
+                  ),
+                  children: (
+                    <Table
+                      size="small"
+                      pagination={false}
+                      dataSource={monthlyConc.map(r => {
+                        const isYoY = compMode === "yoy";
+                        const comp = isYoY ? r.prevData : monthlyConc.find(x => x.month === r.month - 1);
+                        return {
+                          key: r.month,
+                          month: `${r.month}月`,
+                          channels: r.total_channels,
+                          channelsComp: comp?.total_channels,
+                          // 二八法则: 前top20渠道的分钟数占该月总分钟数的百分比
+                          top20: `${(r.top20_pct * 100).toFixed(1)}%`,
+                          top20Comp: comp ? `${(comp.top20_pct * 100).toFixed(1)}%` : "-",
+                          singleCust: r.single_cust_channel_count,
+                          singleCustComp: comp?.single_cust_channel_count,
+                          head: r.head_channel_count,
+                          headComp: comp?.head_channel_count,
+                          tail: r.tail_channel_count,
+                          tailComp: comp?.tail_channel_count,
+                          churn: r.churn_channel_count,
+                          newCh: r.new_channel_count,
+                        };
+                      })}
+                      columns={[
+                        { title: "月份", dataIndex: "month", key: "month", width: 60 },
+                        { title: "外呼渠道数", dataIndex: "channels", key: "channels", align: "right", width: 80 },
+                        { title: compMode === "yoy" ? "同比" : "环比", key: "channelsComp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.month === "1月" || !r.channelsComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = ((r.channels - r.channelsComp) / r.channelsComp * 100);
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.channels} ${compMode==="yoy"?"同比":"环比"}:${r.channelsComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "二八法则", dataIndex: "top20", key: "top20", align: "right", width: 80 },
+                        { title: compMode === "yoy" ? "同比" : "环比", key: "top20Comp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.month === "1月" || r.top20Comp === "-") return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = (parseFloat(r.top20) - parseFloat(r.top20Comp));
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.top20} ${compMode==="yoy"?"同比":"环比"}:${r.top20Comp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "单客户撑起", dataIndex: "singleCust", key: "singleCust", align: "right", width: 80 },
+                        { title: compMode === "yoy" ? "同比" : "环比", key: "singleCustComp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.month === "1月" || !r.singleCustComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = ((r.singleCust - r.singleCustComp) / r.singleCustComp * 100);
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.singleCust} ${compMode==="yoy"?"同比":"环比"}:${r.singleCustComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "头部渠道", dataIndex: "head", key: "head", align: "right", width: 80 },
+                        { title: compMode === "yoy" ? "同比" : "环比", key: "headComp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.month === "1月" || !r.headComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = ((r.head - r.headComp) / r.headComp * 100);
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.head} ${compMode==="yoy"?"同比":"环比"}:${r.headComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "尾部渠道", dataIndex: "tail", key: "tail", align: "right", width: 80 },
+                        { title: compMode === "yoy" ? "同比" : "环比", key: "tailComp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.month === "1月" || !r.tailComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = ((r.tail - r.tailComp) / r.tailComp * 100);
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.tail} ${compMode==="yoy"?"同比":"环比"}:${r.tailComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "流失渠道", dataIndex: "churn", key: "churn", align: "right", width: 80 },
+                        { title: "新增渠道", dataIndex: "newCh", key: "newCh", align: "right", width: 80 },
+                      ]}
+                    />
+                  )
+                }]}
+              />
+            </Card>
+          )}
+
           <Card
             title={
               <span>
@@ -418,7 +619,7 @@ export default function ChannelPage(props) {
                   <Segmented
                     size="small"
                     value={rankingMetric}
-                    onChange={v => { setRankingMetric(v); setSelectedChannelInTable(null); setRankingGrowthSort(null); }}
+                    onChange={v => { setRankingMetric(v); setSelectedChannelInTable(null); setRankingGrowthSortYoY(null); setRankingGrowthSortQoQ(null); }}
                     options={[
                       { label: "通话分钟数", value: "call_minutes" },
                       { label: "外呼量", value: "total_calls" },
@@ -428,17 +629,27 @@ export default function ChannelPage(props) {
                   <span style={{ marginLeft: 8 }}>|</span>
                   <Segmented
                     size="small"
-                    value={rankingGrowthSort}
-                    onChange={v => { setRankingGrowthSort(v); setSelectedChannelInTable(null); }}
+                    value={rankingGrowthSortYoY}
+                    onChange={v => { setRankingGrowthSortYoY(v); setRankingGrowthSortQoQ(null); setSelectedChannelInTable(null); }}
                     options={[
                       { label: "按数值", value: null },
-                      { label: "📈 增长最快", value: "growth_desc" },
-                      { label: "📉 萎缩最大", value: "shrink_desc" },
+                      { label: "同比增长", value: "growth_desc" },
+                      { label: "同比萎缩", value: "shrink_desc" },
                     ]}
                     style={{ marginLeft: 8 }}
                   />
+                  <Segmented
+                    size="small"
+                    value={rankingGrowthSortQoQ}
+                    onChange={v => { setRankingGrowthSortQoQ(v); setRankingGrowthSortYoY(null); setSelectedChannelInTable(null); }}
+                    options={[
+                      { label: "环比增长", value: "growth_desc" },
+                      { label: "环比萎缩", value: "shrink_desc" },
+                    ]}
+                    style={{ marginLeft: 4 }}
+                  />
                   <span style={{ marginLeft: 8 }}>
-                    {rankingGrowthSort ? null : (
+                    {rankingGrowthSortYoY || rankingGrowthSortQoQ ? null : (
                       <>
                         <span style={{ color: "#52c41a" }}>●</span> 优秀&nbsp;
                         <span style={{ color: "#5470c6" }}>●</span> 正常&nbsp;
@@ -593,7 +804,7 @@ export default function ChannelPage(props) {
                 size="small"
               >
                 <Table
-                  columns={monthlyColumns}
+                  columns={isDaily ? dailyColumns : monthlyColumns}
                   dataSource={trendWithDelta}
                   rowKey={isDaily ? "date" : "month"}
                   pagination={false}
