@@ -1,4 +1,5 @@
 import { Select, Space } from "antd";
+import TimeGranularityPicker from "./TimeGranularityPicker";
 
 const FULL_PERIOD_OPTIONS = [
   { label: "全年", value: "full-year" },
@@ -30,6 +31,8 @@ export default function FilterBar({
   availableMonths = [],
   customStart, customEnd, onCustomRangeChange,
   style,
+  // TimeGranularityPicker integration
+  timeRange, onTimeRangeChange,
 }) {
   const periodOptions = [
     ...FULL_PERIOD_OPTIONS,
@@ -41,40 +44,50 @@ export default function FilterBar({
 
   return (
     <Space wrap size={[6, 6]} style={{ display: "flex", flexWrap: "wrap", ...style }}>
-      <Select
-        style={{ width: 90 }}
-        value={selectedYear}
-        onChange={y => { onYearChange(y); onPeriodChange("full-year"); }}
-        options={years.map(y => ({ label: `${y}年`, value: y }))}
-      />
-      <Select
-        style={{ width: 130 }}
-        value={selectedPeriod}
-        onChange={p => { onPeriodChange(p); }}
-        options={periodOptions}
-        optionRender={opt => {
-          if (opt.type === "divider") return <span style={{ color: "#d9d9d9" }}>---</span>;
-          const disabled = opt.disabled;
-          return <span style={{ color: disabled ? "#bfbfbf" : undefined }}>{opt.label}</span>;
-        }}
-      />
-      {isCustom && (
+      {timeRange !== undefined ? (
+        <TimeGranularityPicker
+          value={timeRange}
+          onChange={onTimeRangeChange}
+          defaultGranularity="month"
+        />
+      ) : (
         <>
           <Select
-            style={{ width: 80 }}
-            placeholder="起始月"
-            value={customStart}
-            onChange={v => onCustomRangeChange(v, customEnd)}
-            options={availableMonths.map(m => ({ label: `${m}月`, value: m }))}
+            style={{ width: 90 }}
+            value={selectedYear}
+            onChange={y => { onYearChange(y); onPeriodChange("full-year"); }}
+            options={years.map(y => ({ label: `${y}年`, value: y }))}
           />
-          <span style={{ color: "#888" }}>至</span>
           <Select
-            style={{ width: 80 }}
-            placeholder="结束月"
-            value={customEnd}
-            onChange={v => onCustomRangeChange(customStart, v)}
-            options={availableMonths.filter(m => !customStart || m >= customStart).map(m => ({ label: `${m}月`, value: m }))}
+            style={{ width: 130 }}
+            value={selectedPeriod}
+            onChange={p => { onPeriodChange(p); }}
+            options={periodOptions}
+            optionRender={opt => {
+              if (opt.type === "divider") return <span style={{ color: "#d9d9d9" }}>---</span>;
+              const disabled = opt.disabled;
+              return <span style={{ color: disabled ? "#bfbfbf" : undefined }}>{opt.label}</span>;
+            }}
           />
+          {isCustom && (
+            <>
+              <Select
+                style={{ width: 80 }}
+                placeholder="起始月"
+                value={customStart}
+                onChange={v => onCustomRangeChange(v, customEnd)}
+                options={availableMonths.map(m => ({ label: `${m}月`, value: m }))}
+              />
+              <span style={{ color: "#888" }}>至</span>
+              <Select
+                style={{ width: 80 }}
+                placeholder="结束月"
+                value={customEnd}
+                onChange={v => onCustomRangeChange(customStart, v)}
+                options={availableMonths.filter(m => !customStart || m >= customStart).map(m => ({ label: `${m}月`, value: m }))}
+              />
+            </>
+          )}
         </>
       )}
       <Select

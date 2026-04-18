@@ -4,6 +4,7 @@ import { Row, Col, Card, Table, Segmented, Badge, Select, Button, Collapse } fro
 import { PhoneOutlined, CheckCircleOutlined, ClockCircleOutlined, RiseOutlined } from "@ant-design/icons";
 import { Statistic } from "antd";
 import FilterBar from "../components/FilterBar";
+import TimeGranularityPicker from "../components/TimeGranularityPicker";
 import TrendChart from "../components/TrendChart";
 import EChart from "../components/EChart";
 import * as api from "../api";
@@ -50,12 +51,8 @@ export default function ChannelPage(props) {
   const [years, setYears] = useState([]);
   const [channels, setChannels] = useState([]);
 
-  const [selectedYear, setSelectedYear] = useState(null);
-  const [selectedPeriod, setSelectedPeriod] = useState("full-year");
   const [selectedChannel, setSelectedChannel] = useState(null);
   const [availableMonths, setAvailableMonths] = useState([]);
-  const [customStart, setCustomStart] = useState(null);
-  const [customEnd, setCustomEnd] = useState(null);
 
   const [rankingMetric, setRankingMetric] = useState("call_minutes");
   const [rankingGrowthSortYoY, setRankingGrowthSortYoY] = useState(null); // "growth_desc" | "shrink_desc" | null
@@ -78,6 +75,73 @@ export default function ChannelPage(props) {
     try { return JSON.parse(localStorage.getItem("channelpage_visible_cols")); } catch { return null; }
   });
 
+  // TimeGranularityPicker 状态
+  const [timeRange, setTimeRange] = useState(null);
+
+  /**
+   * 将 TimeRange 转换为 API 参数
+   * 应用"昨天原则"：当前月/周/日时，endDate clip 到昨天
+   */
+  function buildParamsFromTimeRange(tr) {
+    if (!tr) return { year: 2026, quarter: null, month: null, start_date: undefined, end_date: undefined, customStart: null, customEnd: null };
+    const { granularity, startDate, endDate, startKey, endKey } = tr;
+    const today = dayjs();
+    const yesterday = today.subtract(1, "day");
+
+    // clip endDate to yesterday if period includes today
+    const isCurrentPeriod = endDate.isSame(today, "day") || endDate.isAfter(today, "day");
+    const effEnd = isCurrentPeriod ? yesterday : endDate;
+
+    // year always from startKey (first 4 chars or parsed)
+    let year = parseInt(startKey.substring(0, 4));
+    let quarter = null, month = null;
+    let start_date = startDate.format("YYYY-MM-DD");
+    let end_date = effEnd.format("YYYY-MM-DD");
+    let customStart = null, customEnd = null;
+
+    if (granularity === "year") {
+      // full year: use natural dates (past year → Dec 31; current year → yesterday)
+      year = parseInt(startKey);
+      start_date = `${year}-01-01`;
+      end_date = year === today.year() ? yesterday.format("YYYY-MM-DD") : `${year}-12-31`;
+      return { year, quarter: null, month: null, start_date, end_date };
+    }
+    if (granularity === "half") {
+      const y = parseInt(startKey.split("-")[0]);
+      const h = startKey.includes("-H1") ? 1 : 2;
+      quarter = h === 1 ? "H1" : "H2";
+      return { year: y, quarter, month: null, start_date, end_date };
+    }
+    if (granularity === "quarter") {
+      // Single quarter OR range (Q3-Q4): always use start_date/end_date for completeness
+      return { year, quarter: null, month: null, start_date, end_date };
+    }
+    if (granularity === "month") {
+      // Month range (跨年跨月): use start_date/end_date
+      if (startKey !== endKey) {
+        return { year, quarter: null, month: null, start_date, end_date };
+      }
+      // Single natural month: use start_date/end_date (backend will use month param)
+      const y = parseInt(startKey.split("-")[0]);
+      const m = parseInt(startKey.split("-")[1]);
+      return { year: y, quarter: null, month: m, start_date, end_date };
+    }
+    if (granularity === "week" || granularity === "day") {
+      // Arbitrary date range → pass explicit dates
+      return { year, quarter: null, month: null, start_date, end_date };
+    }
+    return { year, quarter: null, month: null, start_date, end_date };
+  }
+
+  // 从 timeRange 派生 year/period（供 FilterBar 和其他老逻辑用）
+  const derived = useMemo(() => buildParamsFromTimeRange(timeRange), [timeRange]);
+  const selectedYear = derived.year;
+  const selectedPeriod = timeRange?.granularity === "month"
+    ? `month-${derived.month}`
+    : timeRange?.granularity === "quarter" ? derived.quarter
+    : timeRange?.granularity === "half" ? (derived.quarter === "H1" ? "first-half" : "second-half")
+    : "full-year";
+
   useEffect(() => {
     let cancelled = false;
     Promise.all([api.getYears(), api.getChannels()]).then(([y, ch]) => {
@@ -85,56 +149,40 @@ export default function ChannelPage(props) {
       const latest = y.length ? y[y.length - 1] : 2026;
       setYears(y);
       setChannels(ch);
-      setSelectedYear(latest);
       api.getMonths(latest).then(m => { if (!cancelled) setAvailableMonths(m); });
+      // Initialize TimeGranularityPicker with current year/month
+      if (!cancelled) {
+        const now = dayjs();
+        const y = now.year();
+        const m = now.month() + 1;
+        setTimeRange({
+          granularity: "month",
+          startKey: `${y}-${String(m).padStart(2, "0")}`,
+          endKey: `${y}-${String(m).padStart(2, "0")}`,
+          label: `${y}年${m}月`,
+          startDate: dayjs(`${y}-${String(m).padStart(2, "0")}-01`),
+          endDate: now.subtract(1, "day"), // yesterday principle
+        });
+      }
     });
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => {
-    if (!selectedYear) return;
-    api.getMonths(selectedYear).then(setAvailableMonths);
-  }, [selectedYear]);
-
   // 渠道商排行榜数据
   useEffect(() => {
-    if (!selectedYear) return;
+    if (!timeRange) return;
     const abortCtrl = new AbortController();
     setLoading(true);
 
-    let quarter = null, month = null;
-    if (selectedPeriod === "full-year") {}
-    else if (["Q1", "Q2", "Q3", "Q4"].includes(selectedPeriod)) quarter = selectedPeriod;
-    else if (selectedPeriod === "first-half") quarter = "H1";
-    else if (selectedPeriod === "second-half") quarter = "H2";
-    else if (selectedPeriod.startsWith("month-")) month = parseInt(selectedPeriod.replace("month-", ""));
+    const { year, quarter, month, start_date, end_date } = derived;
 
     const rankingParams = {
-      year: selectedYear, quarter, month, metric: rankingMetric, limit: 0,
-      start_date: (() => {
-        if (selectedPeriod === "custom" && customStart) return `${selectedYear}-${String(customStart).padStart(2, "0")}-01`;
-        if (month) {
-          return `${selectedYear}-${String(month).padStart(2, "0")}-01`;
-        }
-        return undefined;
-      })(),
-      end_date: (() => {
-        if (selectedPeriod === "custom" && customEnd) return `${selectedYear}-${String(customEnd).padStart(2, "0")}-01`;
-        if (month) {
-          const mStart = dayjs(`${selectedYear}-${String(month).padStart(2, "0")}-01`);
-          if (month === dayjs().month() + 1 && selectedYear === dayjs().year()) {
-            // current month: end_date = yesterday
-            return dayjs().subtract(1, "day").format("YYYY-MM-DD");
-          }
-          return mStart.endOf("month").format("YYYY-MM-DD");
-        }
-        return undefined;
-      })(),
+      year, quarter, month, metric: rankingMetric, limit: 0,
+      start_date, end_date,
       sort_by_growth: rankingGrowthSortYoY,
       sort_by_growth_qoq: rankingGrowthSortQoQ,
     };
-    const concParams = { year: selectedYear, quarter, month, metric: rankingMetric,
-      start_date: rankingParams.start_date, end_date: rankingParams.end_date };
+    const concParams = { year, quarter, month, metric: rankingMetric, start_date, end_date };
 
     api.getChannelRanking(rankingParams).then(ranking => {
       if (abortCtrl.signal.aborted) return;
@@ -148,107 +196,126 @@ export default function ChannelPage(props) {
     }).catch(() => { if (!abortCtrl.signal.aborted) setLoading(false); });
 
     return () => abortCtrl.abort();
-  }, [selectedYear, selectedPeriod, rankingMetric, rankingGrowthSortYoY, rankingGrowthSortQoQ, customStart, customEnd]);
+  }, [derived, rankingMetric, rankingGrowthSortYoY, rankingGrowthSortQoQ]);
 
   // 每月详细数据（折叠展开用）
   useEffect(() => {
-    if (!selectedYear) return;
-    const currentMonth = new Date().getMonth() + 1;
-    const isCurrentYear = selectedYear === new Date().getFullYear();
-    const monthsToFetch = isCurrentYear
-      ? Array.from({ length: currentMonth }, (_, i) => i + 1)
-      : Array.from({ length: 12 }, (_, i) => i + 1);
-    const prevYear = selectedYear - 1;
+    if (!timeRange) return;
+    const { year, start_date, end_date } = derived;
+    const today = dayjs();
+    const yesterday = today.subtract(1, "day");
+
+    // 计算要获取的月份列表（基于日期范围）
+    let monthsToFetch = [];
+
+    if (start_date && end_date) {
+      // 日期范围：解析起始和结束日期，计算范围内的每个月
+      let cur = dayjs(start_date).startOf('month');
+      const end = dayjs(end_date).startOf('month');
+      while (cur.isBefore(end) || cur.isSame(end, 'month')) {
+        monthsToFetch.push({ year: cur.year(), month: cur.month() + 1 });
+        cur = cur.add(1, 'month');
+      }
+    } else {
+      // 非日期范围：使用year逻辑
+      const currentMonth = yesterday.month() + 1;
+      const isCurrentYear = year === today.year();
+      const months = isCurrentYear
+        ? Array.from({ length: currentMonth }, (_, i) => i + 1)
+        : Array.from({ length: 12 }, (_, i) => i + 1);
+      monthsToFetch = months.map(m => ({ year, month: m }));
+    }
+
     Promise.all([
-      ...monthsToFetch.map(m =>
-        api.getChannelConcentration({ year: selectedYear, month: m, metric: rankingMetric })
+      ...monthsToFetch.map(({ year: y, month: m }) =>
+        api.getChannelConcentration({ year: y, month: m, metric: rankingMetric })
       ),
-      ...monthsToFetch.map(m =>
-        api.getChannelConcentration({ year: prevYear, month: m, metric: rankingMetric })
+      ...monthsToFetch.map(({ year: y, month: m }) =>
+        api.getChannelConcentration({ year: y - 1, month: m, metric: rankingMetric })
       ),
     ]).then(results => {
       const curr = results.slice(0, monthsToFetch.length);
       const prev = results.slice(monthsToFetch.length);
       setMonthlyConc(curr.map((r, i) => ({
-        month: monthsToFetch[i],
+        year: monthsToFetch[i].year,
+        month: monthsToFetch[i].month,
         ...r,
         prevData: prev[i] || null,
       })));
     }).catch(() => setMonthlyConc([]));
-  }, [selectedYear, rankingMetric]);
+  }, [derived, rankingMetric]);
 
   // 选中渠道商后，获取详情数据
   useEffect(() => {
     const ch = selectedChannel || selectedChannelInTable;
-    if (!ch || !selectedYear) {
+    if (!ch || !timeRange) {
       setChannelOverview(null);
       setChannelTrend([]);
       return;
     }
 
-    let quarter = null, month = null;
-    if (selectedPeriod === "full-year") {}
-    else if (["Q1", "Q2", "Q3", "Q4"].includes(selectedPeriod)) quarter = selectedPeriod;
-    else if (selectedPeriod === "first-half") quarter = "H1";
-    else if (selectedPeriod === "second-half") quarter = "H2";
-    else if (selectedPeriod.startsWith("month-")) month = parseInt(selectedPeriod.replace("month-", ""));
+    const { year, quarter, month, start_date, end_date } = derived;
+    const isDailyMode = timeRange?.granularity === "day" ||
+      timeRange?.granularity === "week" ||
+      (timeRange?.granularity === "month" && timeRange?.startKey === timeRange?.endKey);
 
-    const isDailyMode = month !== null;
-
-    const params = { year: selectedYear, channel_name: ch };
-    if (quarter) params.quarter = quarter;
-    if (month) params.month = month;
-    if (selectedPeriod === "custom" && customStart && customEnd) {
-      params.start_date = `${selectedYear}-${String(customStart).padStart(2, "0")}-01`;
-      params.end_date = `${selectedYear}-${String(customEnd).padStart(2, "0")}-01`;
+    const params = { year, channel_name: ch };
+    if (start_date && end_date) {
+      params.start_date = start_date;
+      params.end_date = end_date;
+    } else if (quarter) {
+      params.quarter = quarter;
+    } else if (month) {
+      params.month = month;
     }
 
-    const trendParams = { year: selectedYear, channel_name: ch };
-    if (isDailyMode) {
-      const monthStart = dayjs(`${selectedYear}-${String(month).padStart(2, "0")}-01`);
+    const trendParams = { year, channel_name: ch };
+    const isWeekMode = timeRange?.granularity === "week";
+    if (start_date && end_date) {
+      trendParams.start_date = start_date;
+      trendParams.end_date = end_date;
+      trendParams.compare_year = year - 1;
+      if (isWeekMode) {
+        trendParams.granularity = "week";
+      }
+    } else if (isDailyMode && month) {
+      const monthStart = dayjs(`${year}-${String(month).padStart(2, "0")}-01`);
       trendParams.start_date = monthStart.format("YYYY-MM-DD");
-      trendParams.end_date = monthStart.endOf("month").format("YYYY-MM-DD");
-    } else if (selectedPeriod === "custom" && customStart && customEnd) {
-      trendParams.start_date = `${selectedYear}-${String(customStart).padStart(2, "0")}-01`;
-      trendParams.end_date = `${selectedYear}-${String(customEnd).padStart(2, "0")}-01`;
-      trendParams.compare_year = selectedYear - 1;
+      trendParams.end_date = dayjs().subtract(1, "day").format("YYYY-MM-DD");
+      trendParams.compare_year = year - 1;
     } else if (quarter) {
       trendParams.quarter = quarter;
     } else {
-      trendParams.compare_year = selectedYear - 1;
+      trendParams.compare_year = year - 1;
     }
 
     Promise.all([
       api.getChannelOverview(params),
-      isDailyMode ? api.getDailyTrend(trendParams) : api.getMonthlyTrend(trendParams),
+      isWeekMode
+        ? api.getMonthlyTrend({ ...trendParams, granularity: "week" })
+        : isDailyMode ? api.getDailyTrend(trendParams) : api.getMonthlyTrend(trendParams),
     ]).then(([ov, trend]) => {
       setChannelOverview(ov);
       setChannelTrend(Array.isArray(trend) ? trend : []);
     });
-  }, [selectedYear, selectedPeriod, selectedChannel, selectedChannelInTable, customStart, customEnd]);
+  }, [derived, selectedChannel, selectedChannelInTable, timeRange]);
 
   // 获取渠道商Top3客户
   useEffect(() => {
     const ch = selectedChannel || selectedChannelInTable;
-    if (!ch || !selectedYear) {
+    if (!ch || !timeRange) {
       setTopCustomers([]);
       return;
     }
-    let quarter = null, month = null;
-    if (selectedPeriod === "full-year") {}
-    else if (["Q1", "Q2", "Q3", "Q4"].includes(selectedPeriod)) quarter = selectedPeriod;
-    else if (selectedPeriod === "first-half") quarter = "H1";
-    else if (selectedPeriod === "second-half") quarter = "H2";
-    else if (selectedPeriod.startsWith("month-")) month = parseInt(selectedPeriod.replace("month-", ""));
-
+    const { year, quarter, month, start_date, end_date } = derived;
     Promise.all([
-      api.getCompanyRanking({ year: selectedYear, quarter, month, channel_name: ch, metric: rankingMetric, limit: 3 }),
+      api.getCompanyRanking({ year, quarter, month, start_date, end_date, channel_name: ch, metric: rankingMetric, limit: 3 }),
       api.getCompanies({ channel_name: ch }),
     ]).then(([r, comp]) => {
       setTopCustomers(Array.isArray(r) ? r : []);
       setChannelCompanies(Array.isArray(comp) ? comp : []);
     });
-  }, [selectedYear, selectedPeriod, selectedChannel, selectedChannelInTable]);
+  }, [derived, selectedChannel, selectedChannelInTable]);
 
   // 筛渠道商时同步排行榜选中态
   useEffect(() => {
@@ -262,25 +329,46 @@ export default function ChannelPage(props) {
     ? pctFmt(channelOverview.ab_intent / channelOverview.connected_calls)
     : "-";
 
-  const trendWithDelta = useMemo(() => channelTrend.map((row, i) => {
-    const prev = i > 0 ? channelTrend[i - 1] : null;
-    const qoq = {
-      calls_delta: deltaFmt(row.total_calls, prev?.total_calls),
-      minutes_delta: deltaFmt(row.call_minutes, prev?.call_minutes),
-      connect_rate_delta: deltaFmt(row.avg_connect_rate, prev?.avg_connect_rate),
-      intent_rate_delta: deltaFmt(row.intent_rate, prev?.intent_rate),
-    };
-    const yoy = {
-      calls_yoy: deltaFmt(row.total_calls, row.prev_total_calls),
-      minutes_yoy: deltaFmt(row.call_minutes, row.prev_call_minutes),
-      connect_rate_yoy: deltaFmt(row.avg_connect_rate, row.prev_avg_connect_rate),
-      intent_rate_yoy: deltaFmt(row.intent_rate, row.prev_intent_rate),
-    };
-    return { ...row, ...qoq, ...yoy };
-  }), [channelTrend]);
+  const trendWithDelta = useMemo(() => {
+    const isWeekMode = timeRange?.granularity === "week";
+    const endDayOfWeek = timeRange?.endDate?.day() || 0;
+    const lastWeekDays = endDayOfWeek === 0 ? 7 : endDayOfWeek; // 周日到周六为1-6，周日为7（完整周）
+    const isPartialLastWeek = isWeekMode && lastWeekDays < 7;
 
-  const isDaily = useMemo(() => channelTrend.length > 0 && !("month" in channelTrend[0]), [channelTrend]);
-  const chartTitle = isDaily ? "日趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）" : "月度趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）";
+    return channelTrend.map((row, i) => {
+      const prev = i > 0 ? channelTrend[i - 1] : null;
+
+      // 周粒度环比：如果最后一周是部分周（未到周日），则按天数比例调整上周数据进行对比
+      let prevCalls = prev?.total_calls;
+      let prevMinutes = prev?.call_minutes;
+      const isLastRow = i === channelTrend.length - 1;
+      if (isPartialLastWeek && isLastRow && i > 0 && prev) {
+        const ratio = lastWeekDays / 7;
+        prevCalls = Math.round(prev.total_calls * ratio);
+        prevMinutes = Math.round(prev.call_minutes * ratio);
+      }
+
+      const qoq = {
+        calls_delta: deltaFmt(row.total_calls, prevCalls),
+        minutes_delta: deltaFmt(row.call_minutes, prevMinutes),
+        connect_rate_delta: deltaFmt(row.avg_connect_rate, prev?.avg_connect_rate),
+        intent_rate_delta: deltaFmt(row.intent_rate, prev?.intent_rate),
+      };
+      const yoy = {
+        calls_yoy: deltaFmt(row.total_calls, row.prev_total_calls),
+        minutes_yoy: deltaFmt(row.call_minutes, row.prev_call_minutes),
+        connect_rate_yoy: deltaFmt(row.avg_connect_rate, row.prev_avg_connect_rate),
+        intent_rate_yoy: deltaFmt(row.intent_rate, row.prev_intent_rate),
+      };
+      return { ...row, ...qoq, ...yoy };
+    });
+  }, [channelTrend, timeRange]);
+
+  const isDaily = useMemo(() => channelTrend.length > 0 && channelTrend[0] && ("date" in channelTrend[0]), [channelTrend]);
+  const chartTitle = timeRange?.granularity === "week"
+    ? "周趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）"
+    : isDaily ? "日趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）"
+    : "月度趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）";
 
   const deltaTag = (delta) => {
     if (!delta) return <span style={{ color: "#aaa" }}>-</span>;
@@ -387,7 +475,23 @@ export default function ChannelPage(props) {
   ];
 
   const monthlyColumns = [
-    { title: "月份", dataIndex: "month", key: "month", render: m => `${Math.round(m)}月`, width: 60 },
+    { title: "月份", dataIndex: "period_key", key: "month", render: m => `${((Math.round(Number(m)) - 1) % 12) + 1}月`, width: 60 },
+    { title: "外呼量", dataIndex: "total_calls", key: "total_calls", render: v => numFmt(v), align: "right" },
+    { title: "环比", dataIndex: "calls_delta", key: "calls_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "calls_yoy", key: "calls_yoy", render: deltaTag, align: "right" },
+    { title: "通话分钟数", dataIndex: "call_minutes", key: "call_minutes", render: v => numFmt(v), align: "right" },
+    { title: "环比", dataIndex: "minutes_delta", key: "minutes_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "minutes_yoy", key: "minutes_yoy", render: deltaTag, align: "right" },
+    { title: "接通率", dataIndex: "avg_connect_rate", key: "avg_connect_rate", render: v => pctFmt(v), align: "right" },
+    { title: "环比", dataIndex: "connect_rate_delta", key: "connect_rate_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "connect_rate_yoy", key: "connect_rate_yoy", render: deltaTag, align: "right" },
+    { title: "意向率", dataIndex: "intent_rate", key: "intent_rate", render: v => pctFmt(v), align: "right" },
+    { title: "环比", dataIndex: "intent_rate_delta", key: "intent_rate_delta", render: deltaTag, align: "right" },
+    { title: "同比", dataIndex: "intent_rate_yoy", key: "intent_rate_yoy", render: deltaTag, align: "right" },
+  ];
+
+  const weeklyColumns = [
+    { title: "周", dataIndex: "period_key", key: "period_key", render: w => `第${Math.round(Number(w)) % 52 || 52}周`, width: 60 },
     { title: "外呼量", dataIndex: "total_calls", key: "total_calls", render: v => numFmt(v), align: "right" },
     { title: "环比", dataIndex: "calls_delta", key: "calls_delta", render: deltaTag, align: "right" },
     { title: "同比", dataIndex: "calls_yoy", key: "calls_yoy", render: deltaTag, align: "right" },
@@ -418,18 +522,29 @@ export default function ChannelPage(props) {
     { title: "同比", dataIndex: "intent_rate_yoy", key: "intent_rate_yoy", render: deltaTag, align: "right" },
   ];
 
+  // 周粒度时用周数据
+  const isWeekMode = timeRange?.granularity === "week";
+  const trendColumns = useMemo(() => {
+    if (isWeekMode) return weeklyColumns;
+    if (isDaily) return dailyColumns;
+    return monthlyColumns;
+  }, [isDaily, isWeekMode]);
+
   const selectedChannelName = selectedChannelInTable || selectedChannel;
 
   return (
     <div style={{ padding: "20px 24px" }}>
       <Card bordered={false} style={{ marginBottom: 16, position: "sticky", top: 64, zIndex: 100 }}>
         <FilterBar
-          years={years} selectedYear={selectedYear} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); setRankingGrowthSortYoY(null); setRankingGrowthSortQoQ(null); }}
-          selectedPeriod={selectedPeriod} onPeriodChange={p => { setSelectedPeriod(p); setRankingGrowthSortYoY(null); setRankingGrowthSortQoQ(null); }}
+          years={years} selectedYear={selectedYear}
           channels={channels} selectedChannel={selectedChannel} onChannelChange={v => { setSelectedChannel(v); setRankingGrowthSortYoY(null); setRankingGrowthSortQoQ(null); }}
           availableMonths={availableMonths}
-          customStart={customStart} customEnd={customEnd}
-          onCustomRangeChange={(s, e) => { setCustomStart(s); setCustomEnd(e); }}
+          timeRange={timeRange}
+          onTimeRangeChange={tr => {
+            setTimeRange(tr);
+            setRankingGrowthSortYoY(null);
+            setRankingGrowthSortQoQ(null);
+          }}
         />
       </Card>
 
@@ -538,12 +653,14 @@ export default function ChannelPage(props) {
                     <Table
                       size="small"
                       pagination={false}
-                      dataSource={monthlyConc.map(r => {
+                      dataSource={monthlyConc.map((r, idx) => {
                         const isYoY = compMode === "yoy";
-                        const comp = isYoY ? r.prevData : monthlyConc.find(x => x.month === r.month - 1);
+                        const prevItem = idx > 0 ? monthlyConc[idx - 1] : null;
+                        const comp = isYoY ? r.prevData : prevItem;
                         return {
-                          key: r.month,
-                          month: `${r.month}月`,
+                          key: `${r.year}-${r.month}`,
+                          year: r.year,
+                          month: `${r.year}年${r.month}月`,
                           channels: r.total_channels,
                           channelsComp: comp?.total_channels,
                           // 二八法则: 前top20渠道的分钟数占该月总分钟数的百分比
@@ -560,11 +677,11 @@ export default function ChannelPage(props) {
                         };
                       })}
                       columns={[
-                        { title: "月份", dataIndex: "month", key: "month", width: 60 },
+                        { title: "月份", dataIndex: "month", key: "month", width: 80 },
                         { title: "外呼渠道数", dataIndex: "channels", key: "channels", align: "right", width: 80 },
                         { title: compMode === "yoy" ? "同比" : "环比", key: "channelsComp", align: "right", width: 80,
                           render: (_, r) => {
-                            if (r.month === "1月" || !r.channelsComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            if (!r.channelsComp) return <span style={{ color: "#aaa" }}>-</span>;
                             const chg = ((r.channels - r.channelsComp) / r.channelsComp * 100);
                             return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.channels} ${compMode==="yoy"?"同比":"环比"}:${r.channelsComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
                           }
@@ -572,7 +689,7 @@ export default function ChannelPage(props) {
                         { title: "二八法则", dataIndex: "top20", key: "top20", align: "right", width: 80 },
                         { title: compMode === "yoy" ? "同比" : "环比", key: "top20Comp", align: "right", width: 80,
                           render: (_, r) => {
-                            if (r.month === "1月" || r.top20Comp === "-") return <span style={{ color: "#aaa" }}>-</span>;
+                            if (!r.top20Comp) return <span style={{ color: "#aaa" }}>-</span>;
                             const chg = (parseFloat(r.top20) - parseFloat(r.top20Comp));
                             return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.top20} ${compMode==="yoy"?"同比":"环比"}:${r.top20Comp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
                           }
@@ -580,7 +697,7 @@ export default function ChannelPage(props) {
                         { title: "单客户撑起", dataIndex: "singleCust", key: "singleCust", align: "right", width: 80 },
                         { title: compMode === "yoy" ? "同比" : "环比", key: "singleCustComp", align: "right", width: 80,
                           render: (_, r) => {
-                            if (r.month === "1月" || !r.singleCustComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            if (!r.singleCustComp) return <span style={{ color: "#aaa" }}>-</span>;
                             const chg = ((r.singleCust - r.singleCustComp) / r.singleCustComp * 100);
                             return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.singleCust} ${compMode==="yoy"?"同比":"环比"}:${r.singleCustComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
                           }
@@ -588,7 +705,7 @@ export default function ChannelPage(props) {
                         { title: "头部渠道", dataIndex: "head", key: "head", align: "right", width: 80 },
                         { title: compMode === "yoy" ? "同比" : "环比", key: "headComp", align: "right", width: 80,
                           render: (_, r) => {
-                            if (r.month === "1月" || !r.headComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            if (!r.headComp) return <span style={{ color: "#aaa" }}>-</span>;
                             const chg = ((r.head - r.headComp) / r.headComp * 100);
                             return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.head} ${compMode==="yoy"?"同比":"环比"}:${r.headComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
                           }
@@ -596,7 +713,7 @@ export default function ChannelPage(props) {
                         { title: "尾部渠道", dataIndex: "tail", key: "tail", align: "right", width: 80 },
                         { title: compMode === "yoy" ? "同比" : "环比", key: "tailComp", align: "right", width: 80,
                           render: (_, r) => {
-                            if (r.month === "1月" || !r.tailComp) return <span style={{ color: "#aaa" }}>-</span>;
+                            if (!r.tailComp) return <span style={{ color: "#aaa" }}>-</span>;
                             const chg = ((r.tail - r.tailComp) / r.tailComp * 100);
                             return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.tail} ${compMode==="yoy"?"同比":"环比"}:${r.tailComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
                           }
@@ -794,7 +911,7 @@ export default function ChannelPage(props) {
 
               {/* 趋势图 */}
               <Card title={chartTitle} bordered={false} size="small">
-                <TrendChart title={chartTitle} data={channelTrend} isDaily={isDaily} />
+                <TrendChart title={chartTitle} data={channelTrend} isDaily={isDaily} granularity={timeRange?.granularity} />
               </Card>
 
               {/* 月度环比表 */}
@@ -804,12 +921,12 @@ export default function ChannelPage(props) {
                 size="small"
               >
                 <Table
-                  columns={isDaily ? dailyColumns : monthlyColumns}
+                  columns={trendColumns}
                   dataSource={trendWithDelta}
-                  rowKey={isDaily ? "date" : "month"}
+                  rowKey={isWeekMode ? "period_key" : isDaily ? "date" : "period_key"}
                   pagination={false}
                   size="small"
-                  scroll={{ x: isDaily ? 800 : 1100 }}
+                  scroll={{ x: isWeekMode ? 1100 : isDaily ? 800 : 1100 }}
                 />
               </Card>
             </div>

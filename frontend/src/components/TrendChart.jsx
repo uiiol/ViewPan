@@ -21,7 +21,7 @@ const ALL_SERIES = [
   { name: "意向率", type: "line", yAxisIndex: 1, dataKey: "intent_rate", color: "#ee6666" },
 ];
 
-export default function TrendChart({ title, data, isDaily }) {
+export default function TrendChart({ title, data, isDaily, granularity }) {
   const [selectedMetrics, setSelectedMetrics] = useState(["外呼量", "通话分钟数", "接通率", "意向率"]);
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -36,19 +36,39 @@ export default function TrendChart({ title, data, isDaily }) {
     const hasRate = visibleSeries.some(s => s.yAxisIndex === 1);
     const hasCount = visibleSeries.some(s => s.yAxisIndex === 0);
 
+    const isWeek = granularity === "week";
+    const getMonth = pk => ((Math.round(Number(pk)) - 1) % 12) + 1;
+    const getWeek = pk => Math.round(Number(pk)) % 52 || 52;
     const xAxisData = isDaily
       ? data.map(d => (d.date || "").slice(5))
-      : data.map(d => `${Math.round(d.month)}月`);
+      : isWeek
+        ? data.map(d => `第${getWeek(d.period_key)}周`)
+        : data.map(d => `${getMonth(d.period_key)}月`);
 
     const option = {
       tooltip: {
         trigger: "axis",
-        formatter: params => params.map(p => {
-          let val = p.value;
-          if (p.seriesName === "接通率" || p.seriesName === "意向率") val = pctFmt(val);
-          else val = numFmt(val);
-          return `${p.marker} ${p.seriesName}: ${val}`;
-        }).join("<br/>"),
+        formatter: params => {
+          const d = data[params[0]?.dataIndex];
+          const lines = params.map(p => {
+            let val = p.value;
+            if (p.seriesName === "接通率" || p.seriesName === "意向率") val = pctFmt(val);
+            else val = numFmt(val);
+            return `${p.marker} ${p.seriesName}: ${val}`;
+          });
+          // 添加同比百分比
+          if (d?.prev_total_calls && d?.total_calls) {
+            const yoy = ((d.total_calls - d.prev_total_calls) / d.prev_total_calls * 100).toFixed(1);
+            const sign = yoy >= 0 ? "+" : "";
+            lines.push(`<span style="color:#888">同比:</span> <span style="color:${yoy >= 0 ? '#52c41a' : '#ff4d4f'}">${sign}${yoy}%</span>`);
+          }
+          if (d?.prev_call_minutes && d?.call_minutes) {
+            const yoy = ((d.call_minutes - d.prev_call_minutes) / d.prev_call_minutes * 100).toFixed(1);
+            const sign = yoy >= 0 ? "+" : "";
+            lines.push(`<span style="color:#888">通话分钟数同比:</span> <span style="color:${yoy >= 0 ? '#52c41a' : '#ff4d4f'}">${sign}${yoy}%</span>`);
+          }
+          return lines.join("<br/>");
+        },
       },
       legend: { data: visibleSeries.map(s => s.name) },
       grid: { left: 50, right: 20, bottom: 30, top: 40, containLabel: true },
@@ -77,7 +97,7 @@ export default function TrendChart({ title, data, isDaily }) {
         chartRef.current = null;
       }
     };
-  }, [data, isDaily, selectedMetrics]);
+  }, [data, isDaily, granularity, selectedMetrics]);
 
   return (
     <Card

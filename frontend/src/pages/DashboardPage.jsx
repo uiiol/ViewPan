@@ -125,7 +125,10 @@ export default function DashboardPage() {
     const m = data.monthly_data[i];
     if (!m || m.call_minutes <= 0 || !prevMins[i]) return null;
     return ((v - prevMins[i]) / prevMins[i]) * 100;
-  }) : [];
+  }) : data.monthly_data.map((m, i) => {
+    if (!m || m.call_minutes <= 0 || !m.prev_call_minutes) return null;
+    return ((m.call_minutes - m.prev_call_minutes) / m.prev_call_minutes) * 100;
+  });
 
   // 累计同比涨幅/跌幅用于图例
   const totalCurr = currMins[currMins.length - 1] || 0;
@@ -150,7 +153,7 @@ export default function DashboardPage() {
           if (num != null) {
             const color = num >= 0 ? "#52c41a" : "#ff4d4f";
             const sign = num >= 0 ? "+" : "";
-            rows.push(`<span style="color:${color}">●</span> 对比差距：${sign}${num.toFixed(2)}%`);
+            rows.push(`<span style="color:${color}">●</span> ${selectedYear}年与${selectedYear-1}年同期差距：${sign}${num.toFixed(2)}%`);
           }
         }
         return `<div style="font-size:11"><strong>${month}</strong><br/>${rows.join("<br/>")}</div>`;
@@ -186,6 +189,12 @@ export default function DashboardPage() {
       { name: `${selectedYear}年`, type: "bar", data: currData, itemStyle: { color: "#5470c6" } },
       { name: `${selectedYear - 1}年同期`, type: "bar", data: prevData, itemStyle: { color: "#ccc" } },
       { name: "目标月均线", type: "line", data: months.map(() => targetMonthly), itemStyle: { color: "#ee6666" }, smooth: false, symbol: "none", lineStyle: { type: "dashed", width: 1 } },
+      {
+        name: `同比涨幅`,
+        type: "bar",
+        data: gapPct.map(v => v != null ? { value: v, itemStyle: { color: v >= 0 ? "#52c41a" : "#ff4d4f" } } : { value: null }),
+        barWidth: 18,
+      },
     ],
   };
 
@@ -451,7 +460,14 @@ export default function DashboardPage() {
       <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
         <Col xs={24} md={12}>
           <Card
-            title="客户结构"
+            title={
+              <span>
+                客户结构
+                <span style={{ fontSize: 11, color: "#888", marginLeft: 12 }}>
+                  内圈：通话分钟数构成 | 外圈：客户数量构成
+                </span>
+              </span>
+            }
             bordered={false}
             bodyStyle={{ paddingBottom: 8 }}
             extra={

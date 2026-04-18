@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract, and_, text
 from typing import Optional
-from datetime import date
+from datetime import date, timedelta
 import os
 import httpx
 import pandas as pd
@@ -90,51 +90,107 @@ def get_monthly_trend(
     quarter: Optional[str] = Query(None, description="季度: Q1/Q2/Q3/Q4"),
     month: Optional[int] = Query(None, description="指定月份 1-12"),
     compare_year: Optional[int] = Query(None, description="同比年份，如传入则返回当年与该年同月的同比数据"),
+    start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),
+    granularity: Optional[str] = Query(None, description="粒度: month/week, 默认month"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     quarter_map = {"Q1": (1, 3), "Q2": (4, 6), "Q3": (7, 9), "Q4": (10, 12), "H1": (1, 6), "H2": (7, 12)}
     cond = [extract("year", CallRecord.call_date) == year]
     m_start, m_end = None, None
-    if quarter and quarter in quarter_map:
+    if start_date and end_date:
+        # 日期范围：直接用日期过滤，不受year参数限制
+        cond = []
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+        if ed >= today:
+            ed = yesterday
+            if sd > ed:
+                sd = ed
+        cond.append(CallRecord.call_date >= sd.isoformat())
+        cond.append(CallRecord.call_date <= ed.isoformat())
+    elif start_date:
+        cond = []
+        cond.append(CallRecord.call_date >= start_date)
+        if end_date:
+            cond.append(CallRecord.call_date <= end_date)
+    elif quarter and quarter in quarter_map:
         m_start, m_end = quarter_map[quarter]
-        cond.append(extract("month", CallRecord.call_date) >= m_start)
-        cond.append(extract("month", CallRecord.call_date) <= m_end)
+        _q_start = date(year, m_start, 1)
+        _q_end_day = 28 if m_end in (2,) else (30 if m_end in (4,6,9,11) else 31)
+        _q_end = date(year, m_end, _q_end_day)
+        # 如果结束月是当月，clip到昨天（昨天原则）
+        if m_end == today.month and year == today.year and _q_end >= today:
+            _q_end = yesterday
+        cond = [
+            extract("year", CallRecord.call_date) == year,
+            CallRecord.call_date >= _q_start.isoformat(),
+            CallRecord.call_date <= _q_end.isoformat(),
+        ]
     elif month:
+        cond = [extract("year", CallRecord.call_date) == year]
         m_start, m_end = month, month
         cond.append(extract("month", CallRecord.call_date) == month)
+        # 如果是当前月，应用昨天原则（限制该月最多到昨天）
+        if month == today.month and year == today.year:
+            cond.append(CallRecord.call_date <= yesterday.isoformat())
     elif year == 2026:
-        # 2026年：只返回到昨天所在月
+        cond = [extract("year", CallRecord.call_date) == year]
         cond.append(extract("month", CallRecord.call_date) <= yesterday.month)
     if company_id:
         cond.append(CallRecord.company_id == company_id)
     if channel_name:
         cond.append(CallRecord.channel_name == channel_name)
+
+    # 按粒度分组：month 或 week
+    use_week = granularity == "week"
+    if use_week:
+        # 周：使用 year*52+week 保证跨年排序和YoY正确
+        group_col = (extract("year", CallRecord.call_date) * 52 + extract("week", CallRecord.call_date)).label("period_key")
+        order_col = extract("year", CallRecord.call_date) * 52 + extract("week", CallRecord.call_date)
+    else:
+        # 月份：使用 year*12+month 保证跨年排序正确
+        group_col = (extract("year", CallRecord.call_date) * 12 + extract("month", CallRecord.call_date)).label("period_key")
+        order_col = extract("year", CallRecord.call_date) * 12 + extract("month", CallRecord.call_date)
+
     q = db.query(
-        extract("month", CallRecord.call_date).label("month"),
+        group_col,
         func.sum(CallRecord.total_calls).label("total_calls"),
         func.sum(CallRecord.connected_calls).label("connected_calls"),
         func.sum(CallRecord.call_minutes).label("call_minutes"),
         func.avg(CallRecord.connect_rate).label("avg_connect_rate"),
         (func.sum(CallRecord.intent_a + CallRecord.intent_b) * 1.0 / func.nullif(func.sum(CallRecord.connected_calls), 0)).label("intent_rate"),
-    ).filter(and_(*cond)).group_by("month").order_by("month")
+    ).filter(and_(*cond)).group_by(order_col).order_by(order_col)
     rows = [row._asdict() for row in q.all()]
 
     # 同比数据
     if compare_year:
-        prev_cond = [extract("year", CallRecord.call_date) == compare_year]
-        if quarter and quarter in quarter_map:
+        prev_cond = []
+        if start_date and end_date:
+            # 日期范围：同比 = 同月同日去年（每个日期单独减1年），日期范围已足够，不需要year过滤
+            sd = date.fromisoformat(start_date)
+            ed = date.fromisoformat(end_date)
+            prev_sd = sd.replace(year=sd.year - 1)
+            prev_ed = ed.replace(year=ed.year - 1)
+            prev_cond.append(CallRecord.call_date >= prev_sd.isoformat())
+            prev_cond.append(CallRecord.call_date <= prev_ed.isoformat())
+        elif quarter and quarter in quarter_map:
+            prev_cond = [extract("year", CallRecord.call_date) == compare_year]
             # 季度筛选：同季度对比
             prev_cond.append(extract("month", CallRecord.call_date) >= m_start)
             prev_cond.append(extract("month", CallRecord.call_date) <= m_end)
         elif month:
+            prev_cond = [extract("year", CallRecord.call_date) == compare_year]
             # 月份筛选：当月对比
             prev_cond.append(extract("month", CallRecord.call_date) == month)
         elif year == 2026:
+            prev_cond = [extract("year", CallRecord.call_date) == compare_year]
             # 2026年：对比 Jan 1 ~ 昨天 与 去年同期同天
             prev_cond.append(CallRecord.call_date >= f"{compare_year}-01-01")
             prev_cond.append(CallRecord.call_date <= f"{compare_year}-{yesterday.month:02d}-{yesterday.day:02d}")
         else:
+            prev_cond = [extract("year", CallRecord.call_date) == compare_year]
             # 过去年份：对比整年
             prev_cond.append(CallRecord.call_date >= f"{compare_year}-01-01")
             prev_cond.append(CallRecord.call_date <= f"{compare_year}-12-31")
@@ -143,21 +199,24 @@ def get_monthly_trend(
         if channel_name:
             prev_cond.append(CallRecord.channel_name == channel_name)
         prev_q = db.query(
-            extract("month", CallRecord.call_date).label("month"),
+            (extract("year", CallRecord.call_date) * 52 + extract("week", CallRecord.call_date)).label("period_key") if use_week else (extract("year", CallRecord.call_date) * 12 + extract("month", CallRecord.call_date)).label("period_key"),
             func.sum(CallRecord.total_calls).label("total_calls"),
             func.sum(CallRecord.connected_calls).label("connected_calls"),
             func.sum(CallRecord.call_minutes).label("call_minutes"),
             func.avg(CallRecord.connect_rate).label("avg_connect_rate"),
             (func.sum(CallRecord.intent_a + CallRecord.intent_b) * 1.0 / func.nullif(func.sum(CallRecord.connected_calls), 0)).label("intent_rate"),
-        ).filter(and_(*prev_cond)).group_by("month").order_by("month")
-        prev_map = {int(row.month): row._asdict() for row in prev_q.all()}
+        ).filter(and_(*prev_cond)).group_by(order_col).order_by(order_col)
+        # YoY: 同比使用 period_key - 12(月) 或 -52(周) 来匹配去年同期
+        yoy_offset = 52 if use_week else 12
+        prev_map = {int(row.period_key): row._asdict() for row in prev_q.all()}
         for row in rows:
-            m = int(row["month"])
-            if m in prev_map:
-                row["prev_total_calls"] = prev_map[m]["total_calls"]
-                row["prev_call_minutes"] = prev_map[m]["call_minutes"]
-                row["prev_avg_connect_rate"] = prev_map[m]["avg_connect_rate"]
-                row["prev_intent_rate"] = prev_map[m]["intent_rate"]
+            key = int(row["period_key"])
+            yoy_key = key - yoy_offset
+            if yoy_key in prev_map:
+                row["prev_total_calls"] = prev_map[yoy_key]["total_calls"]
+                row["prev_call_minutes"] = prev_map[yoy_key]["call_minutes"]
+                row["prev_avg_connect_rate"] = prev_map[yoy_key]["avg_connect_rate"]
+                row["prev_intent_rate"] = prev_map[yoy_key]["intent_rate"]
 
     return rows
 
@@ -169,15 +228,30 @@ def get_daily_trend(
     end_date: Optional[str] = Query(None),
     company_id: Optional[str] = Query(None),
     channel_name: Optional[str] = Query(None),
+    compare_year: Optional[int] = Query(None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # 当月时 clip 到昨天（昨天原则）
+    if start_date and end_date:
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+        if ed >= today:
+            ed = yesterday
+            if sd > ed:
+                sd = ed
+        _start_date = sd.isoformat()
+        _end_date = ed.isoformat()
+    else:
+        _start_date = start_date
+        _end_date = end_date
+
     cond = []
-    if start_date:
-        cond.append(CallRecord.call_date >= start_date)
-    if end_date:
-        cond.append(CallRecord.call_date <= end_date)
-    if not start_date and not end_date:
+    if _start_date:
+        cond.append(CallRecord.call_date >= _start_date)
+    if _end_date:
+        cond.append(CallRecord.call_date <= _end_date)
+    if not _start_date and not _end_date:
         cond.append(extract("year", CallRecord.call_date) == year)
     if company_id:
         cond.append(CallRecord.company_id == company_id)
@@ -191,7 +265,7 @@ def get_daily_trend(
         func.avg(CallRecord.connect_rate).label("avg_connect_rate"),
         (func.sum(CallRecord.intent_a + CallRecord.intent_b) * 1.0 / func.nullif(func.sum(CallRecord.connected_calls), 0)).label("intent_rate"),
     ).filter(and_(*cond)).group_by(CallRecord.call_date).order_by(CallRecord.call_date)
-    return [{
+    rows = [{
         "date": str(row.call_date),
         "total_calls": row.total_calls,
         "connected_calls": row.connected_calls,
@@ -199,6 +273,39 @@ def get_daily_trend(
         "avg_connect_rate": row.avg_connect_rate,
         "intent_rate": row.intent_rate,
     } for row in q.all()]
+
+    # 同比数据（去年同期同一天）
+    if compare_year and _start_date and _end_date:
+        _sd = date.fromisoformat(_start_date)
+        _ed = date.fromisoformat(_end_date)
+        prev_cond = [
+            extract("year", CallRecord.call_date) == compare_year,
+            CallRecord.call_date >= _sd.replace(year=compare_year),
+            CallRecord.call_date <= _ed.replace(year=compare_year),
+        ]
+        if company_id:
+            prev_cond.append(CallRecord.company_id == company_id)
+        if channel_name:
+            prev_cond.append(CallRecord.channel_name == channel_name)
+        prev_q = db.query(
+            CallRecord.call_date,
+            func.sum(CallRecord.total_calls).label("total_calls"),
+            func.sum(CallRecord.connected_calls).label("connected_calls"),
+            func.sum(CallRecord.call_minutes).label("call_minutes"),
+            func.avg(CallRecord.connect_rate).label("avg_connect_rate"),
+            (func.sum(CallRecord.intent_a + CallRecord.intent_b) * 1.0 / func.nullif(func.sum(CallRecord.connected_calls), 0)).label("intent_rate"),
+        ).filter(and_(*prev_cond)).group_by(CallRecord.call_date).order_by(CallRecord.call_date)
+        prev_map = {str(row.call_date): row._asdict() for row in prev_q.all()}
+        for row in rows:
+            p = prev_map.get(row["date"].replace(str(year), str(compare_year)))
+            if p:
+                row["prev_total_calls"] = p["total_calls"]
+                row["prev_connected_calls"] = p["connected_calls"]
+                row["prev_call_minutes"] = p["call_minutes"]
+                row["prev_avg_connect_rate"] = p["avg_connect_rate"]
+                row["prev_intent_rate"] = p["intent_rate"]
+
+    return rows
 
 
 @router.get("/companies")
@@ -357,12 +464,18 @@ def get_channel_overview(
     quarter: Optional[str] = Query(None),
     month: Optional[int] = Query(None),
     channel_name: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     quarter_map = {"Q1": (1, 3), "Q2": (4, 6), "Q3": (7, 9), "Q4": (10, 12), "H1": (1, 6), "H2": (7, 12)}
     cond = [extract("year", CallRecord.call_date) == year]
-    if quarter and quarter in quarter_map:
+    if start_date:
+        cond.append(CallRecord.call_date >= start_date)
+        if end_date:
+            cond.append(CallRecord.call_date <= end_date)
+    elif quarter and quarter in quarter_map:
         m_start, m_end = quarter_map[quarter]
         cond.append(extract("month", CallRecord.call_date) >= m_start)
         cond.append(extract("month", CallRecord.call_date) <= m_end)
@@ -486,9 +599,21 @@ def get_channel_ranking(
             sd = start_date if isinstance(start_date, date) else date.fromisoformat(start_date)
             ed = end_date if isinstance(end_date, date) else date.fromisoformat(end_date)
             duration = (ed - sd).days + 1  #天数
-            prev_ed = sd - timedelta(days=1)
-            prev_sd = prev_ed - timedelta(days=duration - 1)
-            qoq_cond = _build_cond(year, sd=prev_sd.isoformat(), ed=prev_ed.isoformat())
+            # 特殊情况：1月1日 → 去年7月1日（对齐月份边界）
+            if sd.month == 1 and sd.day == 1:
+                # 上个周期 = 去年7月1日 ~ 去年12月31日（6个月）
+                prev_yr = sd.year - 1
+                prev_sd = date(prev_yr, 7, 1)
+                prev_ed = date(prev_yr, 12, 31)
+            # 特殊情况：7月1日 → 同年1月1日（对齐月份边界）
+            elif sd.month == 7 and sd.day == 1:
+                prev_sd = date(sd.year, 1, 1)
+                prev_ed = date(sd.year, 6, 30)
+            else:
+                prev_ed = sd - timedelta(days=1)
+                prev_sd = sd - timedelta(days=duration)
+            qoq_yr = prev_sd.year
+            qoq_cond = _build_cond(qoq_yr, sd=prev_sd.isoformat(), ed=prev_ed.isoformat())
         elif quarter in ("H1", "H2"):
             if quarter == "H1":
                 qoq_yr, qoq_q = year - 1, "H2"
@@ -597,33 +722,44 @@ def get_channel_concentration(
     # 计算周期内的月份数
     period_months = 12
     _period_sd, _period_ed = None, None
-    if quarter and quarter in quarter_map:
+    if start_date and end_date:
+        # 日期范围：clip 到昨天（昨天原则）
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+        if ed >= today:
+            ed = yesterday
+            if sd > ed:
+                sd = ed
+        _period_sd = sd.isoformat()
+        _period_ed = ed.isoformat()
+        # period_months = 实际天数 / 30
+        period_months = max(0.1, (ed - sd).days + 1) / 30.0
+        cond = [extract("year", CallRecord.call_date) == year,
+                CallRecord.call_date >= _period_sd,
+                CallRecord.call_date <= _period_ed]
+    elif quarter and quarter in quarter_map:
         m_start, m_end = quarter_map[quarter]
         period_months = m_end - m_start + 1
         cond.append(extract("month", CallRecord.call_date) >= m_start)
         cond.append(extract("month", CallRecord.call_date) <= m_end)
         _period_sd = f"{year}-{m_start:02d}-01"
-        _period_ed = f"{year}-{m_end:02d}-28"  # 已过完的周期 → 用完整月
+        _period_ed = f"{year}-{m_end:02d}-28"
     elif month:
         period_months = 1
         cond.append(extract("month", CallRecord.call_date) == month)
         _period_sd = f"{year}-{month:02d}-01"
-        # 当前月（month == today.month and year == today.year）→ 昨天原则；已过完的月 → 完整月
         if month == date.today().month and year == date.today().year:
             _period_ed = f"{year}-{month:02d}-{yesterday.day:02d}"
+            period_months = max(0.1, yesterday.day) / 30.0
         elif end_date:
             _period_ed = end_date
         else:
             _period_ed = f"{year}-{month:02d}-28"
-    elif start_date:
-        _period_sd = start_date
-        _period_ed = end_date
     else:
-        # 全年模式：当期 → 昨天原则（当前是2026年，只看有数据的期间）
+        # 全年模式
         if year == date.today().year:
             _period_sd = f"{year}-01-01"
             _period_ed = f"{year}-{yesterday.month:02d}-{yesterday.day:02d}"
-            # 完整月 + 当月已过天数占比（如4月16天 ≈ 0.53个月）
             period_months = (yesterday.month - 1) + (yesterday.day / 30.0)
         else:
             _period_sd = f"{year}-01-01"
@@ -653,33 +789,46 @@ def get_channel_concentration(
     # 流失渠道：去年有外呼，今年同期无外呼
     prev_year = year - 1
     prev_cond = [extract("year", CallRecord.call_date) == prev_year]
+    prev_period_months = 12  # 默认全年
     if quarter and quarter in quarter_map:
         ms, me = quarter_map[quarter]
         prev_cond.append(extract("month", CallRecord.call_date) >= ms)
         prev_cond.append(extract("month", CallRecord.call_date) <= me)
         prev_sd = f"{prev_year}-{ms:02d}-01"
-        # 已过完的周期 → 用完整月（如Q1=3月28日）
         prev_ed = f"{prev_year}-{me:02d}-28"
+        prev_period_months = me - ms + 1
+    elif start_date and end_date:
+        # 日期范围：平移12个月到去年
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+        prev_sd_dt = sd.replace(year=prev_year)
+        prev_ed_dt = ed.replace(year=prev_year)
+        prev_cond = [extract("year", CallRecord.call_date) == prev_year,
+                    CallRecord.call_date >= prev_sd_dt.isoformat(),
+                    CallRecord.call_date <= prev_ed_dt.isoformat()]
+        prev_sd = prev_sd_dt.isoformat()
+        prev_ed = prev_ed_dt.isoformat()
+        prev_period_months = max(0.1, (prev_ed_dt - prev_sd_dt).days + 1) / 30.0
     elif month:
         prev_cond.append(extract("month", CallRecord.call_date) == month)
         prev_sd = f"{prev_year}-{month:02d}-01"
-        # 过去月（month < today.month）→ 完整月；当前月 → 昨天原则
-        if month < date.today().month and year == date.today().year:
-            _day = 31 if month in (1,3,5,7,8,10,12) else 30 if month in (4,6,9,11) else 28
+        # 当前月 → 去年同期；过去月 → 完整月
+        if month == date.today().month and year == date.today().year:
+            _day = yesterday.day
         elif end_date:
             _day = int(end_date.split("-")[2])
         else:
             _day = 31 if month in (1,3,5,7,8,10,12) else 30 if month in (4,6,9,11) else 28
         prev_ed = f"{prev_year}-{month:02d}-{_day:02d}"
-    elif start_date:
-        prev_cond.append(CallRecord.call_date >= start_date)
-        if end_date:
-            prev_cond.append(CallRecord.call_date <= end_date)
-        prev_sd = start_date.replace(str(year), str(prev_year), 1)
-        prev_ed = end_date.replace(str(year), str(prev_year), 1) if end_date else None
+        # 去年同期月数：与当期一致（当前月用昨天原则，去年同期也用相同天数）
+        if month == date.today().month and year == date.today().year:
+            prev_period_months = max(0.1, _day) / 30.0
+        else:
+            prev_period_months = 1
     else:
         prev_sd = f"{prev_year}-01-01"
         prev_ed = f"{prev_year}-12-31"
+        prev_period_months = 12
 
     prev_channel_q = db.query(CallRecord.channel_name).filter(and_(*prev_cond)).distinct()
     prev_channel_names = set(row.channel_name for row in prev_channel_q.all())
@@ -720,8 +869,8 @@ def get_channel_concentration(
             CallRecord.call_date <= prev_ed,
         ).group_by(CallRecord.channel_name).all()
         prev_ch_totals_map = {row.channel_name: float(row.val or 0) for row in prev_metric_q}
-        prev_head_count = sum(1 for v in prev_ch_totals_map.values() if (v / period_months) > 200000)
-        prev_tail_count = sum(1 for v in prev_ch_totals_map.values() if (v / period_months) < 10000)
+        prev_head_count = sum(1 for v in prev_ch_totals_map.values() if (v / prev_period_months) > 200000)
+        prev_tail_count = sum(1 for v in prev_ch_totals_map.values() if (v / prev_period_months) < 10000)
         # 单客户撑起
         prev_cust_q = db.query(
             CallRecord.channel_name,
@@ -839,6 +988,26 @@ def get_channel_concentration(
                 _day = 31 if prev_m in (1,3,5,7,8,10,12) else 30 if prev_m in (4,6,9,11) else 28
             qoq_ed = f"{year}-{prev_m:02d}-{_day:02d}"
             qoq_period_months = 1
+    elif start_date and end_date:
+        # 日期范围：环比 = 相同天数的前一个周期（遵循昨天原则）
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+        # 当前周期实际截止日（如已clip到昨天）
+        _actual_end = ed if ed < today else yesterday
+        duration = (_actual_end - sd).days + 1  # 实际天数
+        # 特殊边界：1月1日 → 上年12月同期；7月1日 → 上年1月同期
+        if sd.month == 1 and sd.day == 1:
+            qoq_sd = date(sd.year - 1, 10, 1)
+            qoq_ed = date(sd.year - 1, 12, min(31, _actual_end.day))
+        elif sd.month == 7 and sd.day == 1:
+            qoq_sd = date(sd.year, 1, 1)
+            qoq_ed = date(sd.year, 3, min(31, _actual_end.day))
+        else:
+            prev_start = sd - timedelta(days=duration)
+            prev_end = sd - timedelta(days=1)
+            qoq_sd = prev_start
+            qoq_ed = prev_end
+        qoq_period_months = max(0.1, duration) / 30.0
     else:
         # 全年模式：QoQ = Q4去年（去年10月-12月同期）
         if year == date.today().year:
@@ -855,7 +1024,7 @@ def get_channel_concentration(
             CallRecord.channel_name,
             metric_col.label("val"),
         ).filter(
-            extract("year", CallRecord.call_date) == (year - 1 if (quarter == "Q1" or (month == 1) or (not quarter and not month)) else year),
+            extract("year", CallRecord.call_date) == (year - 1 if (quarter == "Q1" or (month == 1) or (not quarter and not month and not start_date and not end_date)) else year),
             CallRecord.call_date >= qoq_sd,
             CallRecord.call_date <= qoq_ed,
         ).group_by(CallRecord.channel_name).all()
@@ -879,7 +1048,7 @@ def get_channel_concentration(
             CallRecord.company_name,
             metric_col.label("val"),
         ).filter(
-            extract("year", CallRecord.call_date) == (year - 1 if (quarter == "Q1" or (month == 1) or (not quarter and not month)) else year),
+            extract("year", CallRecord.call_date) == (year - 1 if (quarter == "Q1" or (month == 1) or (not quarter and not month and not start_date and not end_date)) else year),
             CallRecord.call_date >= qoq_sd,
             CallRecord.call_date <= qoq_ed,
         ).group_by(CallRecord.channel_name, CallRecord.company_name).all()
