@@ -35,6 +35,7 @@ export const getCompanyRanking = (params) => api.get("/api/analytics/companies/r
 export const getChannelRanking = (params) => api.get("/api/analytics/channels/ranking", { params }).then(r => r.data);
 export const getChannelOverview = (params) => api.get("/api/analytics/channels/overview", { params }).then(r => r.data);
 export const getChannelConcentration = (params) => api.get("/api/analytics/channels/concentration", { params }).then(r => r.data);
+export const getCompanyConcentration = (params) => api.get("/api/analytics/companies/concentration", { params }).then(r => r.data);
 export const getDashboardSummary = (params) => api.get("/api/analytics/dashboard/summary", { params }).then(r => r.data);
 export const postAiAnalysis = (data) => api.post("/api/analytics/ai-analysis", data).then(r => r.data);
 

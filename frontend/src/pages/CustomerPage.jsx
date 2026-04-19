@@ -3,6 +3,7 @@ import { Row, Col, Card, Table, Segmented, Badge, Select, Button, Input, Collaps
 import { PhoneOutlined, CheckCircleOutlined, ClockCircleOutlined, RiseOutlined } from "@ant-design/icons";
 import { Statistic } from "antd";
 import FilterBar from "../components/FilterBar";
+import TimeGranularityPicker from "../components/TimeGranularityPicker";
 import TrendChart from "../components/TrendChart";
 import EChart from "../components/EChart";
 import * as api from "../api";
@@ -53,12 +54,16 @@ export default function CustomerPage() {
   const [customStart, setCustomStart] = useState(null);
   const [customEnd, setCustomEnd] = useState(null);
 
+  const [timeRange, setTimeRange] = useState(null);
+
   const [overview, setOverview] = useState(null);
   const [trendData, setTrendData] = useState([]);
   const [ranking, setRanking] = useState([]);
+  const [prevRanking, setPrevRanking] = useState([]);
   const [rankingMetric, setRankingMetric] = useState("call_minutes");
   const [rankingLimit, setRankingLimit] = useState(20);
   const [rankingGrowthSort, setRankingGrowthSort] = useState(null); // null | "growth_desc" | "shrink_desc"
+  const [rankingGrowthSortQoQ, setRankingGrowthSortQoQ] = useState(null); // null | "growth_desc" | "shrink_desc"
   const [selectedCustomerInTable, setSelectedCustomerInTable] = useState(null);
   const [customerTrend, setCustomerTrend] = useState([]);
   const [customerAnalysis, setCustomerAnalysis] = useState("");
@@ -72,6 +77,50 @@ export default function CustomerPage() {
   });
 
   const [loading, setLoading] = useState(true);
+  const [monthlyConc, setMonthlyConc] = useState([]); // 每月详细数据
+  const [concCompMode, setConcCompMode] = useState("qoq"); // "qoq" 环比 | "yoy" 同比
+
+  // ─── TimeGranularityPicker helpers ───────────────────────────────────────────
+  function buildParamsFromTimeRange(tr) {
+    if (!tr) return { year: 2026, quarter: null, month: null, start_date: null, end_date: null };
+    const { granularity, startKey, endKey, startDate, endDate } = tr;
+    const year = startDate.year();
+
+    if (granularity === "year") {
+      return { year: parseInt(startKey), quarter: null, month: null, start_date: null, end_date: null };
+    }
+    if (granularity === "half") {
+      const half = startKey.includes("H1") ? "H1" : "H2";
+      return { year, quarter: half, month: null, start_date: null, end_date: null };
+    }
+    if (granularity === "quarter") {
+      const q = startKey.split("-Q")[1];
+      return { year, quarter: `Q${q}`, month: null, start_date: null, end_date: null };
+    }
+    if (granularity === "month") {
+      const start_date = startDate.format("YYYY-MM-DD");
+      const end_date = endDate.format("YYYY-MM-DD");
+      // Single month: use month param
+      if (startKey === endKey) {
+        const y = parseInt(startKey.split("-")[0]);
+        const m = parseInt(startKey.split("-")[1]);
+        return { year: y, quarter: null, month: m, start_date, end_date };
+      }
+      // Month range: use start_date/end_date
+      return { year, quarter: null, month: null, start_date, end_date };
+    }
+    if (granularity === "week" || granularity === "day") {
+      return { year, quarter: null, month: null, start_date: startDate.format("YYYY-MM-DD"), end_date: endDate.format("YYYY-MM-DD") };
+    }
+    return { year, quarter: null, month: null, start_date: startDate.format("YYYY-MM-DD"), end_date: endDate.format("YYYY-MM-DD") };
+  }
+
+  const derived = useMemo(() => buildParamsFromTimeRange(timeRange), [timeRange]);
+  const selPeriod = timeRange?.granularity === "month" && derived.month != null
+    ? `month-${derived.month}`
+    : timeRange?.granularity === "quarter" ? derived.quarter
+    : timeRange?.granularity === "half" ? (derived.quarter === "H1" ? "first-half" : "second-half")
+    : "full-year";
 
   // AI 分析缓存（localStorage）
   const getAiCacheKey = (companyId, year) => `ai_analysis_${companyId}_${year}`;
@@ -116,6 +165,20 @@ export default function CustomerPage() {
         setChannels(ch);
         setSelectedYear(latest);
         api.getMonths(latest).then(m => { if (!cancelled) setAvailableMonths(m); });
+        // Initialize TimeGranularityPicker
+        if (!cancelled) {
+          const now = dayjs();
+          const y = now.year();
+          const m = now.month() + 1;
+          setTimeRange({
+            granularity: "month",
+            startKey: `${y}-${String(m).padStart(2, "0")}`,
+            endKey: `${y}-${String(m).padStart(2, "0")}`,
+            label: `${y}年${m}月`,
+            startDate: dayjs(`${y}-${String(m).padStart(2, "0")}-01`),
+            endDate: now.subtract(1, "day"),
+          });
+        }
       });
     }
     return () => { cancelled = true; };
@@ -123,14 +186,14 @@ export default function CustomerPage() {
 
   // 年份变化时重新获取可用月份
   useEffect(() => {
-    if (!selectedYear) return;
-    api.getMonths(selectedYear).then(setAvailableMonths);
-  }, [selectedYear]);
+    if (!derived.year) return;
+    api.getMonths(derived.year).then(setAvailableMonths);
+  }, [derived.year]);
 
   // 选中客户时，获取其12个月趋势 + 加载缓存的AI结果
   useEffect(() => {
     const custId = selectedCompany || selectedCustomerInTable;
-    if (!custId || !selectedYear) {
+    if (!custId || !derived.year) {
       setCustomerTrend([]);
       setCustomerAnalysis("");
       setAiResult("");
@@ -139,7 +202,7 @@ export default function CustomerPage() {
       return;
     }
     // 加载缓存的AI分析结果，有内容则展开
-    const cached = loadAiCache(custId, selectedYear);
+    const cached = loadAiCache(custId, derived.year);
     if (cached) {
       setAiResult(cached.analysis || "");
       setCustomerAnalysis(cached.user_analysis || "");
@@ -148,14 +211,16 @@ export default function CustomerPage() {
       setAiResult("");
       setCustomerAnalysis("");
     }
-    api.getMonthlyTrend({
-      year: selectedYear,
-      company_id: custId,
-    }).then(data => {
-      const sorted = Array.isArray(data) ? [...data].sort((a, b) => a.month - b.month) : [];
+    const trendParams = { year: derived.year, company_id: custId, compare_year: derived.year - 1 };
+    if (derived.start_date) trendParams.start_date = derived.start_date;
+    if (derived.end_date) trendParams.end_date = derived.end_date;
+    const paramsKey = JSON.stringify(trendParams);
+    api.getMonthlyTrend(trendParams).then(data => {
+      if (paramsKey !== JSON.stringify(trendParams)) return; // ignore if params changed (stale response)
+      const sorted = Array.isArray(data) ? [...data].sort((a, b) => a.period_key - b.period_key) : [];
       setCustomerTrend(sorted.slice(-12));
-    });
-  }, [selectedCustomerInTable, selectedYear, selectedCompany]);
+    }).catch(() => {});
+  }, [selectedCustomerInTable, derived, selectedCompany]);
 
   // 渠道变化时联动客户列表
   useEffect(() => {
@@ -168,72 +233,137 @@ export default function CustomerPage() {
     });
   }, [selectedChannel]);
 
+  // 每月详细数据（折叠展开用）
   useEffect(() => {
-    if (!selectedYear) return;
+    if (!timeRange) return;
+    const { year, start_date, end_date } = derived;
+    const today = dayjs();
+    const yesterday = today.subtract(1, "day");
+
+    // 计算要获取的月份列表
+    let monthsToFetch = [];
+    if (start_date && end_date) {
+      let cur = dayjs(start_date).startOf("month");
+      const end = dayjs(end_date).startOf("month");
+      while (cur.isBefore(end) || cur.isSame(end, "month")) {
+        monthsToFetch.push({ year: cur.year(), month: cur.month() + 1 });
+        cur = cur.add(1, "month");
+      }
+    } else {
+      const currentMonth = yesterday.month() + 1;
+      const isCurrentYear = year === today.year();
+      const months = isCurrentYear
+        ? Array.from({ length: currentMonth }, (_, i) => i + 1)
+        : Array.from({ length: 12 }, (_, i) => i + 1);
+      monthsToFetch = months.map(m => ({ year, month: m }));
+    }
+
+    Promise.all([
+      ...monthsToFetch.map(({ year: y, month: m }) =>
+        api.getCompanyConcentration({ year: y, month: m, metric: rankingMetric })
+      ),
+      ...monthsToFetch.map(({ year: y, month: m }) =>
+        api.getCompanyConcentration({ year: y - 1, month: m, metric: rankingMetric })
+      ),
+    ]).then(results => {
+      const curr = results.slice(0, monthsToFetch.length);
+      const prev = results.slice(monthsToFetch.length);
+      setMonthlyConc(curr.map((r, i) => ({
+        year: monthsToFetch[i].year,
+        month: monthsToFetch[i].month,
+        ...r,
+        prevData: prev[i] || null,
+      })));
+    }).catch(() => setMonthlyConc([]));
+  }, [derived, rankingMetric]);
+
+  useEffect(() => {
+    if (!derived.year) return;
     const abortCtrl = new AbortController();
 
     setLoading(true);
     // 筛客户优先，其次点击客户
     const activeCustomerId = selectedCompany || selectedCustomerInTable;
     let quarter = null, month = null, monthStart = null, monthEnd = null;
+    const { year: yr, quarter: q, month: m, start_date, end_date } = derived;
 
-    if (selectedPeriod === "full-year") {}
-    else if (["Q1", "Q2", "Q3", "Q4"].includes(selectedPeriod)) quarter = selectedPeriod;
-    else if (selectedPeriod === "first-half") { quarter = "H1"; }
-    else if (selectedPeriod === "second-half") { quarter = "H2"; }
-    else if (selectedPeriod.startsWith("month-")) {
-      month = parseInt(selectedPeriod.replace("month-", ""));
-      monthStart = dayjs(`${selectedYear}-${String(month).padStart(2, "0")}-01`);
+    if (selPeriod === "full-year") {}
+    else if (["Q1", "Q2", "Q3", "Q4"].includes(selPeriod)) quarter = selPeriod;
+    else if (selPeriod === "first-half") { quarter = "H1"; }
+    else if (selPeriod === "second-half") { quarter = "H2"; }
+    else if (selPeriod.startsWith("month-")) {
+      month = parseInt(selPeriod.replace("month-", ""));
+      monthStart = dayjs(`${yr}-${String(month).padStart(2, "0")}-01`);
       monthEnd = monthStart.endOf("month");
     }
 
-    const params = { year: selectedYear };
+    const params = { year: yr };
     if (quarter) params.quarter = quarter;
     if (month) params.month = month;
-    if (selectedPeriod === "custom" && customStart && customEnd) {
-      params.start_date = `${selectedYear}-${String(customStart).padStart(2, "0")}-01`;
-      params.end_date = `${selectedYear}-${String(customEnd).padStart(2, "0")}-01`;
+    if (selPeriod === "custom" && customStart && customEnd) {
+      params.start_date = `${yr}-${String(customStart).padStart(2, "0")}-01`;
+      params.end_date = `${yr}-${String(customEnd).padStart(2, "0")}-01`;
     }
+    if (start_date) params.start_date = start_date;
+    if (end_date) params.end_date = end_date;
     if (selectedChannel) params.channel_name = selectedChannel;
     if (activeCustomerId) params.company_id = activeCustomerId;
 
     const isDailyMode = month !== null;
-    const trendParams = { year: selectedYear };
+    const trendParams = { year: yr };
     if (selectedChannel) trendParams.channel_name = selectedChannel;
     if (activeCustomerId) trendParams.company_id = activeCustomerId;
     if (isDailyMode) {
       trendParams.start_date = monthStart.format("YYYY-MM-DD");
       trendParams.end_date = monthEnd.format("YYYY-MM-DD");
-    } else if (selectedPeriod === "custom" && customStart && customEnd) {
-      trendParams.start_date = `${selectedYear}-${String(customStart).padStart(2, "0")}-01`;
-      trendParams.end_date = `${selectedYear}-${String(customEnd).padStart(2, "0")}-01`;
-      trendParams.compare_year = selectedYear - 1;
+    } else if (selPeriod === "custom" && customStart && customEnd) {
+      trendParams.start_date = `${yr}-${String(customStart).padStart(2, "0")}-01`;
+      trendParams.end_date = `${yr}-${String(customEnd).padStart(2, "0")}-01`;
+      trendParams.compare_year = yr - 1;
+    } else if (start_date && end_date) {
+      // 多月范围（如近3个月、跨年月度范围）使用日期过滤
+      trendParams.start_date = start_date;
+      trendParams.end_date = end_date;
+      trendParams.compare_year = yr - 1;
     } else if (quarter) {
       trendParams.quarter = quarter;
     } else {
       // 非日模式：月度/全年趋势带上同比
-      trendParams.compare_year = selectedYear - 1;
+      trendParams.compare_year = yr - 1;
     }
 
     const rankingParams = {
-      year: selectedYear, channel_name: selectedChannel, company_id: activeCustomerId, quarter, month,
-      metric: rankingMetric, limit: rankingLimit,
+      year: yr, channel_name: selectedChannel, company_id: activeCustomerId, quarter, month,
+      metric: rankingMetric, limit: (rankingGrowthSort || rankingGrowthSortQoQ) ? rankingLimit : 0,
       start_date: params.start_date, end_date: params.end_date,
     };
     if (rankingGrowthSort) {
       rankingParams.sort_by_growth = rankingGrowthSort;
-      rankingParams.compare_year = selectedYear - 1;
+      rankingParams.compare_year = yr - 1;
     }
+    if (rankingGrowthSortQoQ) {
+      rankingParams.sort_by_growth_qoq = rankingGrowthSortQoQ;
+    }
+
+    // Fetch prev year ranking for churn/new customer calculation
+    const prevRankingParams = {
+      year: yr - 1, channel_name: selectedChannel, company_id: activeCustomerId, quarter, month,
+      metric: rankingMetric, limit: 0,
+      start_date: params.start_date ? params.start_date.replace(String(yr), String(yr - 1)) : undefined,
+      end_date: params.end_date ? params.end_date.replace(String(yr), String(yr - 1)) : undefined,
+    };
 
     Promise.all([
       api.getOverview(params),
       isDailyMode ? api.getDailyTrend(trendParams) : api.getMonthlyTrend(trendParams),
       api.getCompanyRanking(rankingParams),
-    ]).then(([ov, trend, rk]) => {
+      api.getCompanyRanking(prevRankingParams),
+    ]).then(([ov, trend, rk, prevRk]) => {
       if (abortCtrl.signal.aborted) return;
       setOverview(ov);
       setTrendData(Array.isArray(trend) ? trend : []);
       setRanking(Array.isArray(rk) ? rk : []);
+      setPrevRanking(Array.isArray(prevRk) ? prevRk : []);
       setLoading(false);
     }).catch(err => {
       if (err.name === "CanceledError") return;
@@ -242,7 +372,7 @@ export default function CustomerPage() {
     });
 
     return () => abortCtrl.abort();
-  }, [selectedYear, selectedPeriod, selectedChannel, selectedCompany, selectedCustomerInTable, rankingMetric, rankingLimit, rankingGrowthSort, customStart, customEnd]);
+  }, [derived, selPeriod, selectedChannel, selectedCompany, selectedCustomerInTable, rankingMetric, rankingLimit, rankingGrowthSort, rankingGrowthSortQoQ, customStart, customEnd]);
 
   const avgConnectRate = overview?.avg_connect_rate ? pctFmt(overview.avg_connect_rate) : "-";
   const intentRate = overview?.ab_intent && overview?.connected_calls
@@ -266,8 +396,63 @@ export default function CustomerPage() {
     return { ...row, ...qoq, ...yoy };
   }), [trendData]);
 
-  const isDaily = useMemo(() => trendData.length > 0 && !("month" in trendData[0]), [trendData]);
-  const chartTitle = isDaily ? "日趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）" : "月度趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）";
+  const isDaily = useMemo(() => trendData.length > 0 && trendData[0] && ("date" in trendData[0]), [trendData]);
+  const chartTitle = timeRange?.granularity === "week"
+    ? "周趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）"
+    : isDaily ? "日趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）"
+    : "月度趋势（外呼量 / 通话分钟数 / 接通率 / 意向率）";
+
+  // Compute period months for head/tail calculation
+  const periodMonths = useMemo(() => {
+    const today = dayjs();
+    const yesterday = today.subtract(1, "day");
+    if (selPeriod === "full-year") {
+      if (derived.year === today.year()) {
+        // Use day-of-year / 30 for elapsed months in current year
+        const startOfYear = yesterday.startOf("year");
+        const doy = yesterday.diff(startOfYear, "day") + 1;
+        return Math.max(0.1, doy / 30);
+      }
+      return 12;
+    }
+    if (selPeriod === "first-half" || selPeriod === "second-half") return 6;
+    if (["Q1", "Q2", "Q3", "Q4"].includes(selPeriod)) return 3;
+    if (selPeriod?.startsWith("month-")) return 1;
+    if (derived.start_date && derived.end_date) {
+      const sd = dayjs(derived.start_date);
+      const ed = dayjs(derived.end_date);
+      return Math.max(0.1, ed.diff(sd, "day") + 1) / 30;
+    }
+    return 1;
+  }, [derived, selPeriod]);
+
+  // Compute customer concentration metrics
+  const customerConc = useMemo(() => {
+    if (!ranking.length) return null;
+    const totalMinutes = ranking.reduce((s, r) => s + (r.call_minutes || 0), 0);
+    const top20Count = Math.max(1, Math.floor(ranking.length * 0.2));
+    const top20Minutes = ranking.slice(0, top20Count).reduce((s, r) => s + (r.call_minutes || 0), 0);
+    const top20Contribution = totalMinutes > 0 ? top20Minutes / totalMinutes : 0;
+    const headCount = ranking.filter(r => {
+      const avgMonthly = (r.call_minutes || 0) / Math.max(0.1, periodMonths);
+      return avgMonthly > 20 * 10000;
+    }).length;
+    const tailCount = ranking.filter(r => {
+      const avgMonthly = (r.call_minutes || 0) / Math.max(0.1, periodMonths);
+      return avgMonthly < 1 * 10000;
+    }).length;
+    const currIds = new Set(ranking.map(r => r.company_id));
+    const prevIds = new Set(prevRanking.map(r => r.company_id));
+    const churnCount = prevRanking.filter(r => !currIds.has(r.company_id)).length;
+    const newCount = ranking.filter(r => !prevIds.has(r.company_id)).length;
+    return { total_customers: ranking.length, top20Contribution, headCount, tailCount, churnCount, newCount };
+  }, [ranking, prevRanking, periodMonths]);
+
+  const pctChg = (curr, prev) => {
+    if (prev == null || prev === 0) return null;
+    const pct = ((curr - prev) / prev) * 100;
+    return `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`;
+  };
 
   const deltaTag = (delta) => {
     if (!delta) return <span style={{ color: "#aaa" }}>-</span>;
@@ -312,6 +497,11 @@ export default function CustomerPage() {
   const custRankingStats = useMemo(() => {
     return statsFromArr(ranking, rankingMetric);
   }, [ranking, rankingMetric]);
+
+  // 用于图表和表格显示的排行数据（受TOP限制），计算类用途仍用 ranking（全量）
+  const displayRanking = useMemo(() => {
+    return rankingLimit > 0 ? ranking.slice(0, rankingLimit) : ranking;
+  }, [ranking, rankingLimit]);
   const getCustRankColor = (val) => {
     if (showGrowthCol) {
       if (val == null) return "#5470c6";
@@ -327,7 +517,7 @@ export default function CustomerPage() {
   const totalCallMinutes = useMemo(() => ranking.reduce((s, r) => s + (r.call_minutes || 0), 0), [ranking]);
 
   const metricLabel = { call_minutes: "通话分钟数", total_calls: "外呼量", connected_calls: "接通量" };
-  const showGrowthCol = rankingGrowthSort != null;
+  const showGrowthCol = rankingGrowthSort != null || rankingGrowthSortQoQ != null;
   const growthFmt = (v) => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`;
   const rankingOption = {
     animation: true,
@@ -337,17 +527,19 @@ export default function CustomerPage() {
       trigger: "axis", axisPointer: { type: "shadow" },
       formatter: params => {
         const d = params[0];
-        const item = ranking.find(r => r.company_name === d.name);
+        const item = displayRanking.find(r => r.company_name === d.name);
         const channel = item?.channel_name || "-";
         if (showGrowthCol && item) {
+          const isQoQ = rankingGrowthSortQoQ != null;
           const curr = item[rankingMetric] || 0;
-          const prev = item[`prev_${rankingMetric}`] || 0;
+          const prev = isQoQ ? (item.qoq_prev_value || 0) : (item[`prev_${rankingMetric}`] || 0);
           const absDelta = curr - prev;
           const absSign = absDelta >= 0 ? "+" : "";
+          const compType = isQoQ ? "环比" : "同比";
           return `${d.name}<br/>渠道商: ${channel}<br/>` +
-            `同比增长率: ${growthFmt(d.value)}<br/>` +
-            `同比绝对值: ${absSign}${numFmt(absDelta)}<br/>` +
-            `当期: ${numFmt(curr)} / 同期: ${numFmt(prev)}`;
+            `${compType}增长率: ${growthFmt(d.value)}<br/>` +
+            `${compType}绝对值: ${absSign}${numFmt(absDelta)}<br/>` +
+            `当期: ${numFmt(curr)} / ${compType}: ${numFmt(prev)}`;
         }
         return `${d.name}<br/>渠道商: ${channel}<br/>${metricLabel[rankingMetric]}: ${numFmt(d.value)}`;
       },
@@ -362,15 +554,19 @@ export default function CustomerPage() {
     },
     yAxis: {
       type: "category",
-      data: [...ranking].reverse().map(d => d.company_name),
+      data: [...displayRanking].reverse().map(d => d.company_name),
       axisLabel: { width: 140, overflow: "truncate" },
     },
     series: [{
       type: "bar",
-      data: [...ranking].reverse().map(d => ({
-        value: showGrowthCol ? d.growth_rate : d[rankingMetric],
-        itemStyle: { color: getCustRankColor(showGrowthCol ? d.growth_rate : d[rankingMetric]) },
-      })),
+      data: [...displayRanking].reverse().map(d => {
+        const isQoQ = rankingGrowthSortQoQ != null;
+        const rate = isQoQ ? d.qoq_growth_rate : d.growth_rate;
+        return {
+          value: showGrowthCol ? rate : d[rankingMetric],
+          itemStyle: { color: getCustRankColor(showGrowthCol ? rate : d[rankingMetric]) },
+        };
+      }),
       label: {
         show: true, position: "right",
         formatter: p => showGrowthCol ? growthFmt(p.value) : numFmt(p.value),
@@ -380,7 +576,7 @@ export default function CustomerPage() {
 
   const handleChartClick = (params) => {
     const clickedName = params.name;
-    const clickedRow = ranking.find(r => r.company_name === clickedName);
+    const clickedRow = displayRanking.find(r => r.company_name === clickedName);
     if (clickedRow) {
       const next = selectedCustomerInTable === clickedRow.company_id ? null : clickedRow.company_id;
       setSelectedCustomerInTable(next);
@@ -513,14 +709,16 @@ export default function CustomerPage() {
       {/* ① 筛选栏（始终固定顶部） */}
       <Card bordered={false} style={{ marginBottom: 16, position: "sticky", top: 64, zIndex: 100 }}>
         <FilterBar
-          years={years} selectedYear={selectedYear} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); setRankingGrowthSort(null); }}
-          selectedPeriod={selectedPeriod} onPeriodChange={p => { setSelectedPeriod(p); setRankingGrowthSort(null); }}
+          years={years} selectedYear={derived.year} onYearChange={y => { setSelectedYear(y); setSelectedPeriod("full-year"); setRankingGrowthSort(null); }}
+          selectedPeriod={selPeriod} onPeriodChange={p => { setSelectedPeriod(p); setRankingGrowthSort(null); }}
           channels={channels} selectedChannel={selectedChannel} onChannelChange={v => { setSelectedChannel(v); if (!v) setSelectedCompany(null); setRankingGrowthSort(null); }}
           companies={companies} selectedCompany={selectedCompany} onCompanyChange={setSelectedCompany}
           showCompany={true}
           availableMonths={availableMonths}
           customStart={customStart} customEnd={customEnd}
           onCustomRangeChange={(s, e) => { setCustomStart(s); setCustomEnd(e); }}
+          timeRange={timeRange}
+          onTimeRangeChange={tr => { setTimeRange(tr); setRankingGrowthSort(null); }}
         />
       </Card>
 
@@ -528,6 +726,165 @@ export default function CustomerPage() {
       <Row gutter={[16, 16]} align="stretch">
         {/* 左侧：排行榜（图表 + 表格） */}
         <Col span={selectedCustomer ? 10 : 24} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {/* 客户分布 */}
+          {customerConc && (
+            <Card title="客户分布" bordered={false} size="small">
+              <Row gutter={[12, 8]}>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>外呼客户数</div>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: "#5470c6", cursor: "default" }}
+                    title={`当期：${customerConc.total_customers} 客户`}
+                  >
+                    {customerConc.total_customers}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>客户总数</div>
+                </Col>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>二八法则</div>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: customerConc.top20Contribution >= 0.8 ? "#ff4d4f" : customerConc.top20Contribution >= 0.5 ? "#fa8c16" : "#52c41a", cursor: "default" }}
+                    title={`前20%占分钟数：${(customerConc.top20Contribution * 100).toFixed(1)}%`}
+                  >
+                    {(customerConc.top20Contribution * 100).toFixed(1)}%
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>前20%占分钟数</div>
+                </Col>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>头部客户</div>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: customerConc.headCount > 0 ? "#ff4d4f" : "#52c41a", cursor: "default" }}
+                    title={`月均 > 20万分钟的客户数：${customerConc.headCount}`}
+                  >
+                    {customerConc.headCount}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>月均 &gt; 20万分钟</div>
+                </Col>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>尾部客户</div>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: customerConc.tailCount > 0 ? "#fa8c16" : "#52c41a", cursor: "default" }}
+                    title={`月均 < 1万分钟的客户数：${customerConc.tailCount}`}
+                  >
+                    {customerConc.tailCount}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>月均 &lt; 1万分钟</div>
+                </Col>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>流失客户</div>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: customerConc.churnCount > 0 ? "#ff4d4f" : "#52c41a" }}
+                  >
+                    {customerConc.churnCount}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>去年有今无</div>
+                </Col>
+                <Col span={4}>
+                  <div style={{ fontSize: 12, color: "#888", marginBottom: 4 }}>新增客户</div>
+                  <div
+                    style={{ fontSize: 22, fontWeight: 700, color: customerConc.newCount > 0 ? "#52c41a" : "#5470c6" }}
+                  >
+                    {customerConc.newCount}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#aaa" }}>去年无今有</div>
+                </Col>
+              </Row>
+            </Card>
+          )}
+
+          {/* 每月详细数据 */}
+          {monthlyConc.length > 0 && (
+            <Card bordered={false} size="small">
+              <Collapse
+                ghost
+                items={[{
+                  key: "monthly",
+                  label: (
+                    <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 13, color: "#888" }}>📊 每月详细数据</span>
+                      <Segmented
+                        size="small"
+                        value={concCompMode}
+                        onChange={v => setConcCompMode(v)}
+                        options={[
+                          { label: "环比", value: "qoq" },
+                          { label: "同比", value: "yoy" },
+                        ]}
+                      />
+                    </span>
+                  ),
+                  children: (
+                    <Table
+                      size="small"
+                      pagination={false}
+                      dataSource={monthlyConc.map((r, idx) => {
+                        const isYoY = concCompMode === "yoy";
+                        const prevItem = idx > 0 ? monthlyConc[idx - 1] : null;
+                        const comp = isYoY ? r.prevData : prevItem;
+                        return {
+                          key: `${r.year}-${r.month}`,
+                          year: r.year,
+                          month: `${r.year}年${r.month}月`,
+                          customers: r.total_customers,
+                          customersComp: comp?.total_customers,
+                          // 二八法则: 前20%客户占分钟数的百分比
+                          top20: `${(r.top20_pct * 100).toFixed(1)}%`,
+                          top20Comp: comp ? `${(comp.top20_pct * 100).toFixed(1)}%` : "-",
+                          // 头部客户
+                          head: r.head_customer_count,
+                          headComp: comp?.head_customer_count,
+                          // 尾部客户
+                          tail: r.tail_customer_count,
+                          tailComp: comp?.tail_customer_count,
+                          // 流失/新增
+                          churn: r.churn_customer_count,
+                          newCust: r.new_customer_count,
+                        };
+                      })}
+                      columns={[
+                        { title: "月份", dataIndex: "month", key: "month", width: 80 },
+                        { title: "外呼客户数", dataIndex: "customers", key: "customers", align: "right", width: 80 },
+                        { title: concCompMode === "yoy" ? "同比" : "环比", key: "customersComp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.customersComp == null) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = ((r.customers - r.customersComp) / r.customersComp * 100);
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.customers} ${concCompMode === "yoy" ? "同比" : "环比"}:${r.customersComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "前20%占分钟数", dataIndex: "top20", key: "top20", align: "right", width: 100 },
+                        { title: concCompMode === "yoy" ? "同比" : "环比", key: "top20Comp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (!r.top20Comp) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = (parseFloat(r.top20) - parseFloat(r.top20Comp));
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.top20} ${concCompMode === "yoy" ? "同比" : "环比"}:${r.top20Comp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "头部客户", dataIndex: "head", key: "head", align: "right", width: 80 },
+                        { title: concCompMode === "yoy" ? "同比" : "环比", key: "headComp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.headComp == null) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = ((r.head - r.headComp) / Math.max(1, r.headComp) * 100);
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.head} ${concCompMode === "yoy" ? "同比" : "环比"}:${r.headComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "尾部客户", dataIndex: "tail", key: "tail", align: "right", width: 80 },
+                        { title: concCompMode === "yoy" ? "同比" : "环比", key: "tailComp", align: "right", width: 80,
+                          render: (_, r) => {
+                            if (r.tailComp == null) return <span style={{ color: "#aaa" }}>-</span>;
+                            const chg = ((r.tail - r.tailComp) / Math.max(1, r.tailComp) * 100);
+                            return <span style={{ color: chg >= 0 ? "#52c41a" : "#ff4d4f", cursor: "default" }} title={`当期:${r.tail} ${concCompMode === "yoy" ? "同比" : "环比"}:${r.tailComp}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(1)}%</span>;
+                          }
+                        },
+                        { title: "流失客户", dataIndex: "churn", key: "churn", align: "right", width: 80 },
+                        { title: "新增客户", dataIndex: "newCust", key: "newCust", align: "right", width: 80 },
+                      ]}
+                    />
+                  ),
+                }]}
+              />
+            </Card>
+          )}
+
           {/* 排行榜图表 */}
           <Card
             title={
@@ -560,16 +917,26 @@ export default function CustomerPage() {
                   <Segmented
                     size="small"
                     value={rankingGrowthSort}
-                    onChange={v => { setRankingGrowthSort(v); setSelectedCustomerInTable(null); }}
+                    onChange={v => { setRankingGrowthSort(v); setRankingGrowthSortQoQ(null); setSelectedCustomerInTable(null); }}
                     options={[
                       { label: "按数值", value: null },
-                      { label: "📈 增长最快", value: "growth_desc" },
-                      { label: "📉 萎缩最大", value: "shrink_desc" },
+                      { label: "同比增长", value: "growth_desc" },
+                      { label: "同比萎缩", value: "shrink_desc" },
                     ]}
                     style={{ marginLeft: 8 }}
                   />
+                  <Segmented
+                    size="small"
+                    value={rankingGrowthSortQoQ}
+                    onChange={v => { setRankingGrowthSortQoQ(v); setRankingGrowthSort(null); setSelectedCustomerInTable(null); }}
+                    options={[
+                      { label: "环比增长", value: "growth_desc" },
+                      { label: "环比萎缩", value: "shrink_desc" },
+                    ]}
+                    style={{ marginLeft: 4 }}
+                  />
                   <span style={{ marginLeft: 8 }}>
-                    {rankingGrowthSort ? null : (
+                    {rankingGrowthSort || rankingGrowthSortQoQ ? null : (
                       <>
                         <span style={{ color: "#52c41a" }}>●</span> 优秀&nbsp;
                         <span style={{ color: "#5470c6" }}>●</span> 正常&nbsp;
@@ -583,7 +950,7 @@ export default function CustomerPage() {
             }
             bordered={false}
           >
-            <EChart option={rankingOption} style={{ height: Math.max(300, ranking.length * 28) }} onChartClick={handleChartClick} />
+            <EChart option={rankingOption} style={{ height: Math.max(300, displayRanking.length * 28) }} onChartClick={handleChartClick} />
           </Card>
 
           {/* 客户明细表格 */}
@@ -614,9 +981,9 @@ export default function CustomerPage() {
           >
             <Table
               columns={filteredColumns}
-              dataSource={ranking}
+              dataSource={displayRanking}
               rowKey="company_id"
-              pagination={selectedCompany ? false : { pageSize: rankingLimit }}
+              pagination={selectedCompany ? false : { pageSize: rankingLimit || 20 }}
               size="small"
               rowClassName={row => selectedCustomerInTable === row.company_id ? "ant-table-row-selected" : ""}
               onRow={row => ({
@@ -673,7 +1040,7 @@ export default function CustomerPage() {
                         call_minutes: selectedCustomer.call_minutes,
                         avg_connect_rate: selectedCustomer.avg_connect_rate,
                         intent_rate: selectedCustomer.intent_rate,
-                        year: selectedYear,
+                        year: derived.year,
                       };
                       setAiLoading(true);
                       setAiError(null);
@@ -693,7 +1060,7 @@ export default function CustomerPage() {
                           setAiLoading(false);
                           setAiRetryCount(0);
                           // 覆盖式缓存
-                          saveAiCache(selectedCustomer.company_id, selectedYear, {
+                          saveAiCache(selectedCustomer.company_id, derived.year, {
                             analysis: analysisResult,
                             user_analysis: customerAnalysis,
                           });
@@ -778,12 +1145,12 @@ export default function CustomerPage() {
 
               {/* 趋势图 */}
               <Card title={chartTitle} bordered={false} size="small">
-                <TrendChart title={chartTitle} data={trendData} isDaily={isDaily} />
+                <TrendChart title={chartTitle} data={trendData} isDaily={isDaily} granularity={timeRange?.granularity} />
               </Card>
 
               {/* 环比表 */}
               <Card
-                title={isDaily ? "日环比" : "月度环比（环比：与上月比；同比：与去年同月比）"}
+                title={isDaily ? "日环比" : timeRange?.granularity === "week" ? "周对比（环比：与上周比；同比：与去年同周比）" : "月度环比（环比：与上月比；同比：与去年同月比）"}
                 bordered={false}
                 size="small"
               >

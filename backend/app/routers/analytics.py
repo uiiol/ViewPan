@@ -162,7 +162,14 @@ def get_monthly_trend(
         func.avg(CallRecord.connect_rate).label("avg_connect_rate"),
         (func.sum(CallRecord.intent_a + CallRecord.intent_b) * 1.0 / func.nullif(func.sum(CallRecord.connected_calls), 0)).label("intent_rate"),
     ).filter(and_(*cond)).group_by(order_col).order_by(order_col)
-    rows = [row._asdict() for row in q.all()]
+    rows = q.all()
+    rows = [row._asdict() for row in rows]
+    if not use_week:
+        for row in rows:
+            pk = int(row["period_key"])
+            m = pk % 12
+            row["month"] = m if m != 0 else 12
+            row["year"] = (pk - row["month"]) // 12
 
     # 同比数据
     if compare_year:
@@ -199,19 +206,18 @@ def get_monthly_trend(
         if channel_name:
             prev_cond.append(CallRecord.channel_name == channel_name)
         prev_q = db.query(
-            (extract("year", CallRecord.call_date) * 52 + extract("week", CallRecord.call_date)).label("period_key") if use_week else (extract("year", CallRecord.call_date) * 12 + extract("month", CallRecord.call_date)).label("period_key"),
+            (extract("year", CallRecord.call_date) * 12 + extract("month", CallRecord.call_date)).label("period_key"),
             func.sum(CallRecord.total_calls).label("total_calls"),
             func.sum(CallRecord.connected_calls).label("connected_calls"),
             func.sum(CallRecord.call_minutes).label("call_minutes"),
             func.avg(CallRecord.connect_rate).label("avg_connect_rate"),
             (func.sum(CallRecord.intent_a + CallRecord.intent_b) * 1.0 / func.nullif(func.sum(CallRecord.connected_calls), 0)).label("intent_rate"),
-        ).filter(and_(*prev_cond)).group_by(order_col).order_by(order_col)
-        # YoY: 同比使用 period_key - 12(月) 或 -52(周) 来匹配去年同期
-        yoy_offset = 52 if use_week else 12
+        ).filter(and_(*prev_cond)).group_by(extract("year", CallRecord.call_date) * 12 + extract("month", CallRecord.call_date)).order_by(extract("year", CallRecord.call_date) * 12 + extract("month", CallRecord.call_date))
+        # YoY: 按 year*12+month 匹配（跨年日期范围场景下用 period_key 直接对应）
         prev_map = {int(row.period_key): row._asdict() for row in prev_q.all()}
         for row in rows:
             key = int(row["period_key"])
-            yoy_key = key - yoy_offset
+            yoy_key = key - 12  # 同比 = 去年同一月
             if yoy_key in prev_map:
                 row["prev_total_calls"] = prev_map[yoy_key]["total_calls"]
                 row["prev_call_minutes"] = prev_map[yoy_key]["call_minutes"]
@@ -425,6 +431,69 @@ def get_company_ranking(
         for row in prev_q.all():
             prev_data_map[row.company_id] = row._asdict()
 
+    # ===== 环比数据（上一个月 / 上一季度 / 上一半年 / 上个周期）=====
+    qoq_data_map = {}
+    if sort_by_growth_qoq:
+        from datetime import timedelta
+        period_m = month
+        if not period_m:
+            if quarter in ("H1", "H2"):
+                period_m = 6 if quarter == "H1" else 12
+            elif quarter in ("Q1", "Q2", "Q3", "Q4"):
+                qmap = {"Q1": 3, "Q2": 6, "Q3": 9, "Q4": 12}
+                period_m = qmap.get(quarter)
+            elif year == today.year:
+                period_m = yesterday.month
+            else:
+                period_m = 12
+
+        if start_date and end_date:
+            sd = start_date if isinstance(start_date, date) else date.fromisoformat(start_date)
+            ed = end_date if isinstance(end_date, date) else date.fromisoformat(end_date)
+            duration = (ed - sd).days + 1
+            if sd.month == 1 and sd.day == 1:
+                prev_yr = sd.year - 1
+                prev_sd = date(prev_yr, 7, 1)
+                prev_ed = date(prev_yr, 12, 31)
+            elif sd.month == 7 and sd.day == 1:
+                prev_sd = date(sd.year, 1, 1)
+                prev_ed = date(sd.year, 6, 30)
+            else:
+                prev_ed = sd - timedelta(days=1)
+                prev_sd = sd - timedelta(days=duration)
+            qoq_yr = prev_sd.year
+            qoq_cond = _build_cond(qoq_yr, channel_name, sd=prev_sd.isoformat(), ed=prev_ed.isoformat())
+        elif quarter in ("H1", "H2"):
+            if quarter == "H1":
+                qoq_yr, qoq_q = year - 1, "H2"
+            else:
+                qoq_yr, qoq_q = year, "H1"
+            qoq_cond = _build_cond(qoq_yr, channel_name, q=qoq_q)
+        elif quarter in ("Q1", "Q2", "Q3", "Q4"):
+            q_prev_map = {"Q1": "Q4", "Q2": "Q1", "Q3": "Q2", "Q4": "Q3"}
+            qoq_yr = year - 1 if quarter == "Q1" else year
+            qoq_q = q_prev_map[quarter]
+            qoq_cond = _build_cond(qoq_yr, channel_name, q=qoq_q)
+        elif period_m:
+            if period_m == 1:
+                qoq_yr, qoq_m = year - 1, 12
+            else:
+                qoq_yr, qoq_m = year, period_m - 1
+            qoq_cond = _build_cond(qoq_yr, channel_name, m=qoq_m)
+        else:
+            qoq_yr = year - 1
+            qoq_m = period_m or yesterday.month
+            qoq_cond = _build_cond(qoq_yr, channel_name, m=qoq_m)
+
+        qoq_q = db.query(
+            CallRecord.company_id,
+            func.sum(CallRecord.total_calls).label("total_calls"),
+            func.sum(CallRecord.connected_calls).label("connected_calls"),
+            func.sum(CallRecord.call_minutes).label("call_minutes"),
+        ).filter(and_(*qoq_cond)).group_by(CallRecord.company_id)
+        for row in qoq_q.all():
+            qoq_data_map[row.company_id] = row._asdict()
+
     result = []
     for row in rows:
         d = row._asdict()
@@ -447,13 +516,28 @@ def get_company_ranking(
         else:
             d["growth_rate"] = None
 
+        # 环比增长率
+        qoq = qoq_data_map.get(row.company_id, {})
+        d["qoq_growth_rate"] = None
+        d["qoq_prev_value"] = None
+        if qoq:
+            qoq_val = qoq.get(metric)
+            d["qoq_prev_value"] = qoq_val
+            if curr_val and qoq_val and qoq_val != 0:
+                d["qoq_growth_rate"] = (curr_val - qoq_val) / qoq_val
+
         result.append(d)
 
-    # 增长率排序
+    # 同比排序
     if sort_by_growth == "growth_desc":
         result.sort(key=lambda x: (x["growth_rate"] is not None, x["growth_rate"] or 0), reverse=True)
     elif sort_by_growth == "shrink_desc":
         result.sort(key=lambda x: (x["growth_rate"] is not None, x["growth_rate"] or 0))
+    # 环比排序
+    if sort_by_growth_qoq == "growth_desc":
+        result.sort(key=lambda x: (x["qoq_growth_rate"] is not None, x["qoq_growth_rate"] or 0), reverse=True)
+    elif sort_by_growth_qoq == "shrink_desc":
+        result.sort(key=lambda x: (x["qoq_growth_rate"] is not None, x["qoq_growth_rate"] or 0))
 
     return result if limit == 0 else result[:limit]
 
@@ -1090,6 +1174,374 @@ def get_channel_concentration(
         "qoq_head_count": qoq_head_count,
         "qoq_tail_count": qoq_tail_count,
         "qoq_single_cust_count": qoq_single_cust_count,
+    }
+
+
+@router.get("/companies/concentration")
+def get_company_concentration(
+    year: int = Query(2025),
+    quarter: Optional[str] = Query(None),
+    month: Optional[int] = Query(None),
+    metric: str = Query("call_minutes"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    客户集中度：
+    - total_customers: 当期有外呼的客户数
+    - top20_pct: 前20%客户贡献占比（二八法则）
+    - head_customer_count: 头部客户（月均 > 20万分钟）
+    - tail_customer_count: 尾部客户（月均 < 1万分钟）
+    - single_channel_customer_count: 单渠道撑起的客户（唯一渠道占比>50%）
+    - churn_customer_count: 流失客户（去年同期有外呼，当前无外呼）
+    - new_customer_count: 新增客户（去年同期无外呼，当前有外呼）
+    """
+    quarter_map = {"Q1": (1, 3), "Q2": (4, 6), "Q3": (7, 9), "Q4": (10, 12), "H1": (1, 6), "H2": (7, 12)}
+    yesterday = date.today() - timedelta(days=1)
+
+    def _build_cond(yr, sd=None, ed=None):
+        c = [extract("year", CallRecord.call_date) == yr]
+        if sd:
+            c.append(CallRecord.call_date >= sd)
+        if ed:
+            c.append(CallRecord.call_date <= ed)
+        return c
+
+    def _clip_end_date(sd, ed):
+        """clip end_date to yesterday if it includes today"""
+        if ed >= today:
+            ed = yesterday
+            if sd > ed:
+                sd = ed
+        return sd, ed
+
+    metric_col_map = {
+        "call_minutes": func.sum(CallRecord.call_minutes),
+        "total_calls": func.sum(CallRecord.total_calls),
+        "connected_calls": func.sum(CallRecord.connected_calls),
+    }
+    metric_col = metric_col_map.get(metric, func.sum(CallRecord.call_minutes))
+
+    # ---- 当前周期 cond 和 period_months ----
+    cond = _build_cond(year, start_date, end_date)
+    period_months = 12
+    _period_sd, _period_ed = None, None
+
+    if start_date and end_date:
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(start_date) if start_date == end_date else date.fromisoformat(end_date)
+        sd, ed = _clip_end_date(sd, ed)
+        _period_sd = sd.isoformat()
+        _period_ed = ed.isoformat()
+        period_months = max(0.1, (ed - sd).days + 1) / 30.0
+        cond = [extract("year", CallRecord.call_date) == year,
+                CallRecord.call_date >= _period_sd,
+                CallRecord.call_date <= _period_ed]
+    elif quarter and quarter in quarter_map:
+        m_start, m_end = quarter_map[quarter]
+        period_months = m_end - m_start + 1
+        cond.append(extract("month", CallRecord.call_date) >= m_start)
+        cond.append(extract("month", CallRecord.call_date) <= m_end)
+        _period_sd = f"{year}-{m_start:02d}-01"
+        _period_ed = f"{year}-{m_end:02d}-28"
+    elif month:
+        period_months = 1
+        cond.append(extract("month", CallRecord.call_date) == month)
+        _period_sd = f"{year}-{month:02d}-01"
+        if month == date.today().month and year == date.today().year:
+            _period_ed = f"{year}-{month:02d}-{yesterday.day:02d}"
+            period_months = max(0.1, yesterday.day) / 30.0
+        elif end_date:
+            _period_ed = end_date
+        else:
+            _period_ed = f"{year}-{month:02d}-28"
+    else:
+        # 全年
+        if year == date.today().year:
+            _period_sd = f"{year}-01-01"
+            _period_ed = f"{year}-{yesterday.month:02d}-{yesterday.day:02d}"
+            period_months = (yesterday.month - 1) + (yesterday.day / 30.0)
+        else:
+            _period_sd = f"{year}-01-01"
+            _period_ed = f"{year}-12-31"
+            period_months = 12
+
+    # ---- 当前周期客户汇总 ----
+    cust_total_q = db.query(
+        CallRecord.company_id,
+        CallRecord.company_name,
+        metric_col.label("val"),
+    ).filter(and_(*cond)).group_by(CallRecord.company_id, CallRecord.company_name)
+    cust_totals = {(row.company_id): {"name": row.company_name, "val": float(row.val or 0)} for row in cust_total_q.all()}
+    total_sum = sum(v["val"] for v in cust_totals.values())
+    customers_count = len(cust_totals)
+    curr_customer_ids = set(cust_totals.keys())
+
+    # ---- 二八法则 ----
+    sorted_customers = sorted(cust_totals.items(), key=lambda x: x[1]["val"], reverse=True)
+    top20_pct_count = max(1, int(customers_count * 0.2))
+    cumulate = 0
+    top20_customers = []
+    total_for_pct = total_sum if total_sum > 0 else 1
+    for i, (cid, info) in enumerate(sorted_customers):
+        if i < top20_pct_count:
+            cumulate += info["val"]
+            top20_customers.append(info["name"])
+    top20_contribution = cumulate / total_for_pct
+
+    # ---- 单渠道撑起的客户 ----
+    ch_cust_q = db.query(
+        CallRecord.company_id,
+        CallRecord.channel_name,
+        metric_col.label("val"),
+    ).filter(and_(*cond)).group_by(CallRecord.company_id, CallRecord.channel_name).all()
+    cust_ch_map = {}
+    for row in ch_cust_q:
+        cid = row.company_id
+        if cid not in cust_ch_map:
+            cust_ch_map[cid] = {}
+        cust_ch_map[cid][row.channel_name] = float(row.val or 0)
+
+    single_channel_customers = []
+    for cid, info in cust_totals.items():
+        ch_map = cust_ch_map.get(cid, {})
+        if not ch_map:
+            continue
+        top_ch_val = max(ch_map.values())
+        if info["val"] > 0 and top_ch_val / info["val"] > 0.5:
+            top_ch_name = max(ch_map, key=ch_map.get)
+            single_channel_customers.append({"company": info["name"], "channel": top_ch_name})
+
+    # ---- 头部/尾部客户 ----
+    head_customers, tail_customers = [], []
+    for cid, info in cust_totals.items():
+        monthly_avg = info["val"] / max(0.1, period_months)
+        if monthly_avg > 200000:
+            head_customers.append(info["name"])
+        elif monthly_avg < 10000:
+            tail_customers.append(info["name"])
+
+    # ---- 渠道总数（去重）----
+    ch_q = db.query(CallRecord.channel_name).filter(and_(*cond))
+    total_channels = ch_q.distinct().count()
+
+    # ---- 去年同期流失/新增 ----
+    prev_year = year - 1
+    prev_cond = [extract("year", CallRecord.call_date) == prev_year]
+    prev_period_months = 12
+
+    if quarter and quarter in quarter_map:
+        ms, me = quarter_map[quarter]
+        prev_cond.append(extract("month", CallRecord.call_date) >= ms)
+        prev_cond.append(extract("month", CallRecord.call_date) <= me)
+        prev_period_months = me - ms + 1
+    elif start_date and end_date:
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+        prev_sd_dt = sd.replace(year=prev_year)
+        prev_ed_dt = ed.replace(year=prev_year)
+        prev_cond = [extract("year", CallRecord.call_date) == prev_year,
+                    CallRecord.call_date >= prev_sd_dt.isoformat(),
+                    CallRecord.call_date <= prev_ed_dt.isoformat()]
+        prev_period_months = max(0.1, (prev_ed_dt - prev_sd_dt).days + 1) / 30.0
+    elif month:
+        prev_cond.append(extract("month", CallRecord.call_date) == month)
+        prev_period_months = 1
+    else:
+        prev_period_months = 12
+
+    prev_cust_q = db.query(CallRecord.company_id).filter(and_(*prev_cond)).distinct()
+    prev_customer_ids = set(row.company_id for row in prev_cust_q.all())
+    new_customer_count = len(curr_customer_ids - prev_customer_ids)
+    churn_customer_count = len(prev_customer_ids - curr_customer_ids)
+
+    # ---- 去年同期客户汇总 ----
+    prev_cust_total_q = db.query(
+        CallRecord.company_id,
+        metric_col.label("val"),
+    ).filter(and_(*prev_cond)).group_by(CallRecord.company_id)
+    prev_cust_totals = {row.company_id: float(row.val or 0) for row in prev_cust_total_q.all()}
+    prev_customers_count = len(prev_cust_totals)
+    prev_sum = sum(prev_cust_totals.values())
+
+    prev_sorted = sorted(prev_cust_totals.items(), key=lambda x: x[1], reverse=True)
+    prev_top20_n = max(1, int(prev_customers_count * 0.2))
+    prev_cumulate = 0
+    for i, (_, val) in enumerate(prev_sorted):
+        if i < prev_top20_n:
+            prev_cumulate += val
+    prev_top20_contribution = prev_cumulate / (prev_sum if prev_sum > 0 else 1)
+
+    # 去年同期头部/尾部
+    prev_head_count = 0
+    prev_tail_count = 0
+    if prev_period_months > 0:
+        prev_head_count = sum(1 for v in prev_cust_totals.values() if (v / prev_period_months) > 200000)
+        prev_tail_count = sum(1 for v in prev_cust_totals.values() if (v / prev_period_months) < 10000)
+
+    # 去年同期单渠道客户
+    prev_ch_cust_q = db.query(
+        CallRecord.company_id,
+        CallRecord.channel_name,
+        metric_col.label("val"),
+    ).filter(and_(*prev_cond)).group_by(CallRecord.company_id, CallRecord.channel_name).all()
+    prev_cust_ch_map = {}
+    for row in prev_ch_cust_q:
+        cid = row.company_id
+        if cid not in prev_cust_ch_map:
+            prev_cust_ch_map[cid] = {}
+        prev_cust_ch_map[cid][row.channel_name] = float(row.val or 0)
+    prev_single_channel_count = 0
+    for cid, ch_map in prev_cust_ch_map.items():
+        total_val = prev_cust_totals.get(cid, 0)
+        if total_val > 0:
+            top_ch_val = max(ch_map.values())
+            if top_ch_val / total_val > 0.5:
+                prev_single_channel_count += 1
+
+    # ---- QoQ（环比）----
+    qoq_period_months = period_months
+    qoq_sd, qoq_ed = None, None
+    qoq_customers_count = None
+    qoq_top20_contribution = None
+    qoq_head_count = None
+    qoq_tail_count = None
+    qoq_single_channel_count = None
+
+    if quarter and quarter in quarter_map:
+        _qday = int((_period_ed or "28").split("-")[2])
+        qoq_map = {"Q1": (10, 12, year - 1), "Q2": (1, 3, year), "Q3": (4, 6, year), "Q4": (7, 9, year)}
+        if quarter in qoq_map:
+            ms, me, qyr = qoq_map[quarter]
+            qoq_sd = f"{qyr}-{ms:02d}-01"
+            qoq_ed = f"{qyr}-{me:02d}-{_qday:02d}"
+            qoq_period_months = me - ms + 1
+    elif month:
+        if month == 1:
+            qoq_sd = f"{year - 1}-12-01"
+            qoq_ed = f"{year - 1}-12-31"
+            qoq_period_months = 1
+        else:
+            prev_m = month - 1
+            qoq_sd = f"{year}-{prev_m:02d}-01"
+            if prev_m < date.today().month and year == date.today().year:
+                _day = 31 if prev_m in (1,3,5,7,8,10,12) else 30 if prev_m in (4,6,9,11) else 28
+            elif _period_ed:
+                _day = int(_period_ed.split("-")[2])
+            else:
+                _day = 31 if prev_m in (1,3,5,7,8,10,12) else 30 if prev_m in (4,6,9,11) else 28
+            qoq_ed = f"{year}-{prev_m:02d}-{_day:02d}"
+            qoq_period_months = 1
+    elif start_date and end_date:
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(start_date) if start_date == end_date else date.fromisoformat(end_date)
+        _actual_end = ed if ed < today else yesterday
+        duration = (_actual_end - sd).days + 1
+        if sd.month == 1 and sd.day == 1:
+            qoq_sd = date(sd.year - 1, 10, 1)
+            qoq_ed = date(sd.year - 1, 12, min(31, _actual_end.day))
+        elif sd.month == 7 and sd.day == 1:
+            qoq_sd = date(sd.year, 1, 1)
+            qoq_ed = date(sd.year, 3, min(31, _actual_end.day))
+        else:
+            prev_start = sd - timedelta(days=duration)
+            prev_end = sd - timedelta(days=1)
+            qoq_sd = prev_start
+            qoq_ed = prev_end
+        qoq_period_months = max(0.1, duration) / 30.0
+    else:
+        # 全年：QoQ = Q4去年
+        if year == date.today().year:
+            qoq_sd = f"{year - 1}-10-01"
+            qoq_ed = f"{year - 1}-12-{yesterday.day:02d}"
+            qoq_period_months = 3
+        else:
+            qoq_sd = f"{year - 1}-10-01"
+            qoq_ed = f"{year - 1}-12-28"
+            qoq_period_months = 3
+
+    if qoq_sd and qoq_ed:
+        _use_prev_year = (quarter == "Q1" or (month == 1) or
+                          (not quarter and not month and not start_date and not end_date))
+        _qoy = year - 1 if _use_prev_year else year
+        _qoq_sd = qoq_sd.isoformat() if isinstance(qoq_sd, date) else qoq_sd
+        _qoq_ed = qoq_ed.isoformat() if isinstance(qoq_ed, date) else qoq_ed
+        qoq_cust_q = db.query(
+            CallRecord.company_id,
+            metric_col.label("val"),
+        ).filter(
+            extract("year", CallRecord.call_date) == _qoy,
+            CallRecord.call_date >= _qoq_sd,
+            CallRecord.call_date <= _qoq_ed,
+        ).group_by(CallRecord.company_id).all()
+        qoq_cust_totals = {row.company_id: float(row.val or 0) for row in qoq_cust_q}
+        qoq_customers_count = len(qoq_cust_totals)
+        qoq_sum = sum(qoq_cust_totals.values())
+        # 二八法则
+        qoq_sorted = sorted(qoq_cust_totals.items(), key=lambda x: x[1], reverse=True)
+        qoq_top20_n = max(1, int(qoq_customers_count * 0.2))
+        qoq_cum = 0
+        for i, (_, v) in enumerate(qoq_sorted):
+            if i < qoq_top20_n:
+                qoq_cum += v
+        qoq_top20_contribution = qoq_cum / (qoq_sum if qoq_sum > 0 else 1)
+        # 头部/尾部
+        qoq_head_count = sum(1 for v in qoq_cust_totals.values() if (v / max(0.1, qoq_period_months)) > 200000)
+        qoq_tail_count = sum(1 for v in qoq_cust_totals.values() if (v / max(0.1, qoq_period_months)) < 10000)
+        # 单渠道客户
+        qoq_ch_cust_q = db.query(
+            CallRecord.company_id,
+            CallRecord.channel_name,
+            metric_col.label("val"),
+        ).filter(
+            extract("year", CallRecord.call_date) == _qoy,
+            CallRecord.call_date >= _qoq_sd,
+            CallRecord.call_date <= _qoq_ed,
+        ).group_by(CallRecord.company_id, CallRecord.channel_name).all()
+        qoq_cust_ch_map = {}
+        for row in qoq_ch_cust_q:
+            cid = row.company_id
+            if cid not in qoq_cust_ch_map:
+                qoq_cust_ch_map[cid] = {}
+            qoq_cust_ch_map[cid][row.channel_name] = float(row.val or 0)
+        qoq_single_channel_count = 0
+        for cid, ch_map in qoq_cust_ch_map.items():
+            total_val = qoq_cust_totals.get(cid, 0)
+            if total_val > 0:
+                top_ch_val = max(ch_map.values())
+                if top_ch_val / total_val > 0.5:
+                    qoq_single_channel_count += 1
+
+    return {
+        "total_customers": customers_count,
+        "total_channels": total_channels,
+        "top20_pct": round(top20_contribution, 4),
+        "top20_customer_count": top20_pct_count,
+        "top20_customers": top20_customers,
+        "head_customer_count": len(head_customers),
+        "head_customers": head_customers,
+        "tail_customer_count": len(tail_customers),
+        "tail_customers": tail_customers,
+        "single_channel_customer_count": len(single_channel_customers),
+        "single_channel_customers": single_channel_customers,
+        "period_months": period_months,
+        "churn_customer_count": churn_customer_count,
+        "new_customer_count": new_customer_count,
+        # 去年同期
+        "prev_customers_count": prev_customers_count,
+        "prev_top20_contribution": round(prev_top20_contribution, 4),
+        "prev_head_count": prev_head_count,
+        "prev_tail_count": prev_tail_count,
+        "prev_single_channel_count": prev_single_channel_count,
+        "prev_customer_total": round(prev_sum, 2),
+        # 环比
+        "qoq_customers_count": qoq_customers_count,
+        "qoq_top20_contribution": round(qoq_top20_contribution, 4) if qoq_top20_contribution is not None else None,
+        "qoq_head_count": qoq_head_count,
+        "qoq_tail_count": qoq_tail_count,
+        "qoq_single_channel_count": qoq_single_channel_count,
     }
 
 
